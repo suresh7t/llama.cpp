@@ -1,0 +1,562 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GGBufMoE — Detailed Design Document</title>
+<style>
+:root{--bg:#f7f8fa;--panel:#fff;--text:#1d2430;--muted:#5e6878;--line:#d9dee7;--accent:#315f9b;--code:#f1f3f6;--note:#eef4fb}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,"Segoe UI",Arial,sans-serif;line-height:1.55}
+main{max-width:1180px;margin:auto;padding:42px 34px 80px}header{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:34px 38px;margin-bottom:24px}
+h1{margin:0 0 8px;font-size:34px}h2{margin-top:42px;border-bottom:1px solid var(--line);padding-bottom:8px}h3{margin-top:28px}
+p{max-width:1000px}.subtitle{color:var(--muted);font-size:18px}.meta{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-top:24px}
+.meta div{border:1px solid var(--line);border-radius:8px;padding:12px 14px;background:#fafbfc}.label{display:block;color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.05em}
+code,pre{font-family:ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",monospace}code{background:var(--code);padding:1px 4px;border-radius:3px}
+pre{background:#f4f5f7;border:1px solid var(--line);border-radius:8px;padding:16px;overflow-x:auto;line-height:1.4}
+.note{background:var(--note);border-left:4px solid var(--accent);padding:13px 16px;margin:18px 0}
+table{width:100%;border-collapse:collapse;margin:16px 0 22px;background:var(--panel)}th,td{border:1px solid var(--line);padding:9px 11px;text-align:left;vertical-align:top}th{background:#f0f2f5}
+ul,ol{max-width:1050px}.diagram{border:1px solid var(--line);border-radius:8px;padding:18px;background:#fbfcfd;white-space:pre;overflow-x:auto;font-family:ui-monospace,monospace}
+.small{color:var(--muted);font-size:13px}@media(max-width:760px){main{padding:20px 14px 50px}.meta{grid-template-columns:1fr}header{padding:24px 20px}}
+</style>
+</head>
+<body><main>
+<header>
+<h1>GGBufMoE</h1>
+<div class="subtitle">A database-style asynchronous page buffer for GGUF-backed sparse Mixture-of-Experts models</div>
+<div class="meta">
+<div><span class="label">Prototype</span>C11/C17, standalone</div>
+<div><span class="label">Logical page</span>8 KiB</div>
+<div><span class="label">Primary target</span>Windows + asynchronous file I/O</div>
+<div><span class="label">Initial model</span>Qwen3.8-Flash-Next / GGUF</div>
+<div><span class="label">Repository</span><code>ggbufmoe</code></div>
+<div><span class="label">Branch</span><code>ggbufmoe</code></div>
+</div>
+</header>
+
+<h2>1. Executive Summary</h2>
+<p>GGBufMoE is a standalone C prototype for testing a database-style storage architecture for sparse MoE inference. Instead of allowing <code>mmap()</code> and the operating-system page cache to determine model residency, GGBufMoE explicitly manages model pages, expert-to-page mappings, asynchronous storage I/O, host residency, request coalescing, and LRU eviction.</p>
+<p>The central hypothesis is not that 8 KiB is universally optimal. The hypothesis is that an inference runtime knows considerably more about model access semantics than a generic virtual-memory subsystem does. An application-controlled buffer manager can therefore make expert-aware decisions and overlap storage I/O with computation.</p>
+<div class="note"><strong>Core idea:</strong> treat immutable GGUF model data like a database treats immutable pages: maintain an application-owned directory/index, explicitly fetch pages asynchronously, retain hot pages in a controlled buffer pool, and use model execution knowledge to prefetch pages before they are needed.</div>
+
+<h2>2. Goals and Non-Goals</h2>
+<h3>2.1 Goals</h3>
+<ul><li>Build a small, understandable standalone C implementation.</li><li>Read model data directly from a GGUF file without using memory mapping for model-page residency.</li><li>Represent logical model data using 8 KiB pages.</li><li>Maintain an explicit page directory and LRU buffer pool.</li><li>Map <code>(layer, expert, tensor)</code> to file extents and logical pages.</li><li>Use asynchronous file I/O with multiple outstanding requests.</li><li>Coalesce adjacent logical pages into larger physical reads when useful.</li><li>Use single-flight behavior so concurrent requests for the same missing page share one I/O operation.</li><li>Measure cache behavior, I/O amplification, queue depth, latency, and prefetch effectiveness.</li><li>Create a clean integration boundary that could later be used by llama.cpp.</li></ul>
+<h3>2.2 Non-goals for the first prototype</h3>
+<ul><li>Replacing the llama.cpp tensor/GGML execution engine.</li><li>Implementing CUDA kernels.</li><li>Implementing a complete tokenizer.</li><li>Supporting writable model files or dirty-page writeback.</li><li>Assuming that every GGUF model has expert-contiguous storage.</li><li>Claiming that 8 KiB is the final production page size.</li></ul>
+
+<h2>3. Model and Storage Model</h2>
+<p>GGUF provides an immutable file containing metadata, tensor descriptors, and tensor data. Tensor descriptors identify tensor names, dimensions, data types, and offsets. GGBufMoE treats those offsets as the physical address space from which logical pages are constructed.</p>
+<pre>GGUF file
++---------------------------------------------------------------+
+| Header                                                        |
++---------------------------------------------------------------+
+| Metadata KV                                                   |
+| tokenizer / architecture / dimensions / etc.                 |
++---------------------------------------------------------------+
+| Tensor descriptors                                            |
+| name | shape | type | offset                                  |
++---------------------------------------------------------------+
+| Tensor data                                                   |
+|                                                               |
+|   expert/layer tensor bytes ...                               |
+|                                                               |
++---------------------------------------------------------------+</pre>
+<p>The prototype should first inspect the actual Qwen3.8 GGUF layout. The implementation must not assume that all tensors belonging to an expert are contiguous or that one expert occupies one fixed-size extent.</p>
+
+<h2>4. Target Qwen3.8 Working Set</h2>
+<p>The current target model exposes 48 transformer blocks and 512 routed experts per layer, with 10 experts selected per routing decision. This produces:</p>
+<table><tr><th>Quantity</th><th>Working value</th><th>Meaning</th></tr>
+<tr><td>Layers</td><td>48</td><td>Transformer blocks</td></tr>
+<tr><td>Experts / layer</td><td>512</td><td>Routed expert identities</td></tr>
+<tr><td>Total layer/expert identities</td><td>24,576</td><td>48 × 512</td></tr>
+<tr><td>Selected experts</td><td>10</td><td>Per routing decision</td></tr>
+<tr><td>Context advertised by model</td><td>262,144</td><td>Model metadata</td></tr></table>
+<p>The exact tensor decomposition must be obtained from the GGUF tensor descriptors before finalizing the expert index. The 24,576 figure is an identity count, not a claim about physical storage layout.</p>
+
+<h2>5. Architecture</h2>
+<div class="diagram">                         GGBufMoE
+                            |
+             +--------------+--------------+
+             |                             |
+       Immutable Catalog             Runtime Buffer Manager
+             |                             |
+       GGUF metadata                 +------+------+
+       tensor descriptors            |             |
+       file offsets                  |             |
+             |                 Expert Index    Page Directory
+             |                      |             |
+             +----------------------+-------------+
+                                    |
+                              Host Page Cache
+                              8 KiB logical pages
+                                    |
+                               LRU replacement
+                                    |
+                           Async Storage I/O
+                                    |
+                              GGUF file / SSD</div>
+<h3>5.1 Major components</h3>
+<table><tr><th>Component</th><th>Responsibility</th></tr>
+<tr><td>Catalog</td><td>Parse GGUF metadata and tensor descriptors; establish immutable file extents.</td></tr>
+<tr><td>Expert Index</td><td>Map model-level expert identities to tensor extents and page ranges.</td></tr>
+<tr><td>Page Directory</td><td>Map logical page IDs to cache slots and page state.</td></tr>
+<tr><td>LRU Buffer Pool</td><td>Own host memory used for resident logical pages.</td></tr>
+<tr><td>Request Manager</td><td>Deduplicate requests, track asynchronous reads, and complete waiters.</td></tr>
+<tr><td>Async I/O backend</td><td>Issue and complete overlapped file reads.</td></tr>
+<tr><td>Prefetcher</td><td>Use known future expert requirements to request pages early.</td></tr>
+<tr><td>Statistics</td><td>Record cache, I/O, latency, queue, and prefetch metrics.</td></tr></table>
+
+<h2>6. Index Design</h2>
+<h3>6.1 Expert index</h3>
+<p>A token is not the correct cache key for expert weights. The router operates on the hidden state and selects experts at a particular layer. Therefore the natural identity is:</p>
+<pre>(layer, expert)</pre>
+<p>The tensor dimension is needed because one expert may consist of multiple tensors. A practical catalog representation is:</p>
+<pre>Expert
+  layer
+  expert_id
+  tensor_count
+  tensors[]
+
+TensorExtent
+  tensor_id
+  file_offset
+  byte_length
+  first_page
+  page_count</pre>
+<p>For 48 × 512 identities, a direct two-dimensional array is attractive:</p>
+<pre>expert_index[48][512]</pre>
+<p>The array itself is tiny. The larger objects are the extent lists referenced by each entry. This is analogous to a database index whose key lookup is cheap while the result points to a larger set of pages.</p>
+<h3>6.2 Page identity</h3>
+<p>A logical page is identified by a stable page ID. Conceptually:</p>
+<pre>page_id = logical model byte offset / 8192</pre>
+<p>For pages that cross tensor or alignment boundaries, the catalog can retain the exact file extent needed by the reader. The page ID should therefore be treated as a runtime buffer-manager identity rather than as a promise that every tensor begins on an 8 KiB boundary.</p>
+
+<h2>7. 8 KiB Logical Page Cache</h2>
+<p>The host cache is an explicit buffer pool containing fixed-size 8 KiB logical pages. Each slot contains the page bytes plus management metadata.</p>
+<pre>PageSlot
+  page_id
+  generation
+  state
+  pin_count
+  last_use
+  buffer[8192]</pre>
+<h3>7.1 Page states</h3>
+<table><tr><th>State</th><th>Meaning</th></tr>
+<tr><td>EMPTY</td><td>No logical page assigned.</td></tr>
+<tr><td>LOADING</td><td>An asynchronous read is outstanding.</td></tr>
+<tr><td>RESIDENT</td><td>Page bytes are valid and available to readers.</td></tr>
+<tr><td>EVICTING</td><td>Slot is being removed from active use.</td></tr>
+<tr><td>FAILED</td><td>Last load failed; requesters receive an error.</td></tr></table>
+<h3>7.2 Why separate logical and physical page sizes?</h3>
+<p>The logical cache page remains 8 KiB because it gives the prototype a simple, database-like unit of residency. Physical storage I/O does not have to be 8 KiB.</p>
+<p>For example, eight adjacent logical pages can be serviced by one 64 KiB asynchronous read:</p>
+<pre>logical:  [P100][P101][P102][P103][P104][P105][P106][P107]
+physical: [---------------------- 64 KiB --------------------]
+                              one async read</pre>
+<p>The buffer manager can then install the individual 8 KiB pages into separate cache slots. This lets the experiment measure the tradeoff between fine-grained residency and larger, more efficient physical I/O.</p>
+
+<h2>8. Page Directory and LRU</h2>
+<p>The page directory answers:</p>
+<pre>page_id -> slot_id</pre>
+<p>A hash table is appropriate for a sparse page address space. The LRU structure is independent of the lookup structure:</p>
+<pre>Hash table:
+    page_id -> slot
+
+LRU:
+    MRU <-> ... <-> LRU
+              |
+           eviction</pre>
+<p>This separation is intentional. The hash table provides fast identity lookup; the LRU provides replacement policy. Neither structure needs to contain the page bytes themselves.</p>
+<h3>8.1 Pinning</h3>
+<p>A page that is actively being consumed must not be selected for eviction. A simple reference count or pin count provides this protection:</p>
+<pre>pin_count > 0  => not evictable
+pin_count == 0 => eligible for LRU eviction</pre>
+
+<h2>9. Asynchronous I/O</h2>
+<p>The inference path should not perform synchronous file reads. On Windows, the initial backend should use overlapped file I/O, with an I/O completion mechanism such as IOCP. A later POSIX backend can use an appropriate asynchronous interface such as io_uring.</p>
+<div class="diagram">Request
+   |
+   v
+Page Directory ---- hit ----> RESIDENT page
+   |
+  miss
+   |
+   v
+Is page already LOADING?
+   | yes                         | no
+   v                             v
+attach waiter              allocate slot
+                                |
+                                v
+                           submit async read
+                                |
+                                v
+                         completion queue
+                                |
+                                v
+                         mark RESIDENT
+                                |
+                                v
+                         wake all waiters</div>
+<h3>9.1 Single-flight requests</h3>
+<p>If several inference operations request the same page while it is being loaded, only one physical read should be issued. Additional requesters attach to the existing operation.</p>
+<pre>Bad:
+    request A -> disk read P
+    request B -> disk read P
+    request C -> disk read P
+
+Desired:
+    request A ----+
+    request B ----+--> one disk read P --> all complete
+    request C ----+</pre>
+<h3>9.2 Generation counters</h3>
+<p>A cache slot can be reused while an old asynchronous operation is completing. Every slot therefore receives a generation counter. Completion processing must validate <code>(slot_id, generation, page_id)</code> before installing data. This prevents a stale completion from overwriting a newer page assignment.</p>
+
+<h2>10. Request and Completion API</h2>
+<p>The first C interface should remain deliberately small:</p>
+<pre>gbm_handle *gbm_open(const char *path, const gbm_config *cfg);
+
+int gbm_lookup_page(
+    gbm_handle *h,
+    uint64_t page_id,
+    gbm_page_ref *out);
+
+int gbm_prefetch(
+    gbm_handle *h,
+    const uint64_t *page_ids,
+    size_t count);
+
+int gbm_wait(
+    gbm_handle *h,
+    gbm_page_ref *ref);
+
+void gbm_release(
+    gbm_handle *h,
+    gbm_page_ref *ref);
+
+int gbm_close(gbm_handle *h);</pre>
+<p>The important semantic property is that <code>gbm_lookup_page()</code> may return a pending result rather than forcing a synchronous disk operation. Waiting occurs at an explicit synchronization boundary.</p>
+
+<h2>11. Prefetch Architecture</h2>
+<p>Sparse MoE execution provides unusually valuable information for prefetching. Once the router determines the expert IDs required by a layer, the runtime can translate:</p>
+<pre>(layer, expert)
+      |
+      v
+expert index
+      |
+      v
+tensor extents
+      |
+      v
+logical page IDs
+      |
+      v
+missing pages
+      |
+      v
+async I/O queue</pre>
+<p>The desired sequence is:</p>
+<pre>router
+  -> identify experts
+  -> submit page requests
+  -> perform/overlap I/O
+  -> execute other available work
+  -> consume expert weights</pre>
+<p>This is substantially different from generic OS paging: the application can know that a set of pages will be required before the corresponding matrix operation starts.</p>
+
+<h2>12. Host Cache and GPU Cache</h2>
+<p>The prototype initially concentrates on the host cache. The eventual inference path can have two independent residency domains:</p>
+<pre>                    Model storage
+                         |
+                    async disk I/O
+                         |
+                  +------+------+
+                  |             |
+              Host cache     GPU cache
+                  |             |
+                  +------->-----+
+                     H2D transfer</pre>
+<p>A GPU page miss therefore has two possible outcomes:</p>
+<ol><li>Host page hit: transfer the existing page to GPU memory.</li><li>Host page miss: fetch from storage, install in host cache, then transfer.</li></ol>
+<p>This creates a useful two-level hierarchy without requiring the GPU cache and host cache to share the same replacement policy.</p>
+
+<h2>13. Tokenizer and Vocabulary Boundary</h2>
+<p>Tokenization is deliberately outside the MoE page cache. The model's vocabulary can be represented as a compact lookup structure:</p>
+<pre>UTF-8 input
+    |
+    v
+tokenizer / merge logic
+    |
+    v
+token ID
+    |
+    v
+embedding / transformer
+    |
+    v
+logits
+    |
+    v
+selected token ID
+    |
+    v
+ID -> token string</pre>
+<p>For the vocabulary, the natural reverse mapping is a direct array:</p>
+<pre>token_id -> {offset, length}
+             |
+             v
+       token string blob</pre>
+<p>The forward tokenizer lookup can use a hash table or a radix/trie-like structure. The important architectural point is that token IDs do not identify experts. Expert selection occurs later from the router's computation over the hidden state.</p>
+
+<h2>14. GGUF Catalog Construction</h2>
+<p>The first executable should be a GGUF inspector rather than an inference engine. It should report:</p>
+<ul><li>GGUF version and metadata.</li><li>Tensor count.</li><li>Tensor names.</li><li>Tensor types.</li><li>Tensor dimensions.</li><li>Tensor file offsets and lengths.</li><li>Alignment.</li><li>Likely expert/layer naming patterns.</li><li>Contiguity relationships among expert tensors.</li></ul>
+<p>This inspection step is important because the page mapping must be derived from the actual file rather than from assumptions about the model's logical architecture.</p>
+
+<h2>15. Proposed Source Tree</h2>
+<pre>ggbufmoe/
+├── README.md
+├── DESIGN.html
+├── LICENSE
+├── CMakeLists.txt
+├── include/
+│   └── gbm.h
+├── src/
+│   ├── gbm_store.c
+│   ├── gbm_catalog.c
+│   ├── gbm_expert_index.c
+│   ├── gbm_page_dir.c
+│   ├── gbm_lru.c
+│   ├── gbm_request.c
+│   ├── gbm_stats.c
+│   └── platform/
+│       ├── win_async_io.c
+│       └── posix_async_io.c
+├── tools/
+│   ├── gguf_dump.c
+│   ├── gguf_pages.c
+│   └── gbm_bench.c
+└── tests/
+    ├── test_page_dir.c
+    ├── test_lru.c
+    ├── test_async_io.c
+    └── test_coalesce.c</pre>
+
+<h2>16. C Data Structures</h2>
+<p>A deliberately plain C representation keeps the prototype easy to debug and makes the memory ownership rules visible.</p>
+<pre>typedef enum {
+    GBM_PAGE_EMPTY,
+    GBM_PAGE_LOADING,
+    GBM_PAGE_RESIDENT,
+    GBM_PAGE_EVICTING,
+    GBM_PAGE_FAILED
+} gbm_page_state;
+
+typedef struct {
+    uint64_t page_id;
+    uint32_t slot_id;
+    uint32_t generation;
+    gbm_page_state state;
+    uint32_t pin_count;
+    uint64_t last_use;
+} gbm_page_entry;
+
+typedef struct {
+    uint64_t file_offset;
+    uint32_t length;
+    uint32_t page_first;
+    uint32_t page_count;
+    uint32_t tensor_id;
+} gbm_extent;
+
+typedef struct {
+    uint32_t layer;
+    uint32_t expert_id;
+    uint32_t extent_count;
+    gbm_extent *extents;
+} gbm_expert;</pre>
+<p>The exact structures can evolve after the first GGUF inspection. The prototype should avoid premature abstraction until the actual tensor layout is understood.</p>
+
+<h2>17. Physical Read Coalescing</h2>
+<p>The logical request queue may contain:</p>
+<pre>P100, P101, P102, P103, P104</pre>
+<p>If the corresponding file offsets are adjacent, the request manager can transform them into one physical operation:</p>
+<pre>P100..P104
+      |
+      v
+one contiguous file range
+      |
+      v
+one overlapped read
+      |
+      v
+split completion into five logical pages</pre>
+<p>Coalescing should be configurable. The benchmark must be able to disable it so that its contribution can be measured independently.</p>
+
+<h2>18. Concurrency Model</h2>
+<p>The first implementation should establish clear ownership rather than maximize thread count. A practical model is:</p>
+<ul><li>Inference/request threads submit page requests.</li><li>A request manager protects page-directory state.</li><li>The asynchronous I/O backend owns outstanding file operations.</li><li>Completion processing transitions pages from LOADING to RESIDENT.</li><li>LRU manipulation occurs under controlled synchronization.</li></ul>
+<p>Because the model is read-only, there is no dirty-page or writeback protocol. That significantly simplifies correctness compared with a general-purpose database buffer manager.</p>
+
+<h2>19. Benchmark Plan</h2>
+<p>The prototype should compare progressively more capable mechanisms rather than only comparing two endpoints.</p>
+<table><tr><th>Configuration</th><th>Description</th></tr>
+<tr><td>A</td><td>Baseline <code>mmap</code> access.</td></tr>
+<tr><td>B</td><td>Explicit synchronous reads.</td></tr>
+<tr><td>C</td><td>Explicit asynchronous 8 KiB logical pages.</td></tr>
+<tr><td>D</td><td>Async pages + physical read coalescing.</td></tr>
+<tr><td>E</td><td>Async + coalescing + router-informed prefetch.</td></tr></table>
+<h3>19.1 Metrics</h3>
+<ul><li>Logical page lookups.</li><li>Logical page hits.</li><li>Logical page misses.</li><li>Duplicate/single-flight misses.</li><li>Pages read.</li><li>Physical bytes read.</li><li>Logical bytes consumed.</li><li>Physical/logical I/O amplification.</li><li>Number of outstanding I/O operations.</li><li>Read latency distribution.</li><li>Cache occupancy.</li><li>Evictions per second.</li><li>Prefetch requests.</li><li>Useful prefetches.</li><li>Prefetch waste.</li><li>Time spent waiting for pages.</li><li>CPU cost per lookup.</li></ul>
+<h3>19.2 Important derived metric</h3>
+<pre>I/O amplification =
+    physical bytes read
+    -------------------
+    logical bytes consumed</pre>
+<p>This metric is particularly important when comparing 8 KiB logical pages against larger coalesced physical reads.</p>
+
+<h2>20. Trace-Driven Testing</h2>
+<p>Before integrating with an inference engine, the buffer manager can consume a trace such as:</p>
+<pre>layer expert
+0     17
+0     92
+0    301
+1     17
+1    144
+...</pre>
+<p>The trace driver converts each expert identity into the corresponding page requests. This makes cache algorithms reproducible without requiring GPU execution.</p>
+<p>Later, the trace can be captured from llama.cpp during actual Qwen3.8 inference and replayed against different cache sizes and policies.</p>
+
+<h2>21. Integration Path into llama.cpp</h2>
+<ol><li>Build and validate the GGUF catalog independently.</li><li>Verify expert-to-tensor identification for Qwen3.8.</li><li>Validate page offsets against direct file reads.</li><li>Measure the standalone buffer manager using synthetic traces.</li><li>Capture real expert access traces from llama.cpp.</li><li>Replay real traces without changing inference execution.</li><li>Add asynchronous page prefetch to the inference path.</li><li>Replace selected mmap-backed expert accesses with GGBufMoE page references.</li><li>Measure end-to-end token generation rate and page wait time.</li></ol>
+<div class="note"><strong>Integration principle:</strong> GGBufMoE should first become a measurable storage/cache subsystem. It should not initially be entangled with CUDA kernels, scheduling, or model mathematics.</div>
+
+<h2>22. Failure and Correctness Cases</h2>
+<table><tr><th>Case</th><th>Required behavior</th></tr>
+<tr><td>Disk read failure</td><td>Mark request failed and wake all waiters.</td></tr>
+<tr><td>Duplicate page request</td><td>Attach to existing LOADING operation.</td></tr>
+<tr><td>Slot reused before completion</td><td>Generation check rejects stale completion.</td></tr>
+<tr><td>Page pinned</td><td>Do not evict.</td></tr>
+<tr><td>Cache full and all pages pinned</td><td>Return/backpressure rather than corrupting a live page.</td></tr>
+<tr><td>Coalesced read partially invalid</td><td>Complete valid subranges independently and propagate errors accurately.</td></tr>
+<tr><td>Malformed GGUF</td><td>Catalog construction fails before inference access.</td></tr>
+<tr><td>Unexpected tensor layout</td><td>Catalog reports it explicitly; no guessed expert mapping.</td></tr></table>
+
+<h2>23. Instrumentation</h2>
+<p>Instrumentation should be built into the first version rather than added after performance testing. The statistics structure should include at least:</p>
+<pre>lookups
+hits
+misses
+duplicate_misses
+pages_read
+bytes_read
+io_requests
+io_bytes
+evictions
+prefetch_pages
+prefetch_hits
+prefetch_waste
+wait_ns
+max_io_depth</pre>
+<p>Every benchmark run should be able to emit machine-readable CSV so that cache behavior can be correlated with GPU utilization, disk throughput, and token generation rate.</p>
+
+<h2>24. Implementation Phases</h2>
+<table><tr><th>Phase</th><th>Deliverable</th><th>Status</th></tr>
+<tr><td>1</td><td>GGUF inspector and catalog parser</td><td>Planned</td></tr>
+<tr><td>2</td><td>Logical page reader</td><td>Planned</td></tr>
+<tr><td>3</td><td>Page directory</td><td>Planned</td></tr>
+<tr><td>4</td><td>LRU buffer pool</td><td>Planned</td></tr>
+<tr><td>5</td><td>Windows asynchronous I/O</td><td>Planned</td></tr>
+<tr><td>6</td><td>Read coalescing</td><td>Planned</td></tr>
+<tr><td>7</td><td>Trace driver and instrumentation</td><td>Planned</td></tr>
+<tr><td>8</td><td>Qwen3.8 expert adapter</td><td>Planned</td></tr>
+<tr><td>9</td><td>llama.cpp integration experiment</td><td>Planned</td></tr></table>
+
+<h2>25. Open Questions</h2>
+<ol><li><strong>Exact tensor layout:</strong> Are all expert tensors for a given layer physically contiguous?</li><li><strong>Physical I/O size:</strong> What read size gives the best SSD throughput without causing excessive read amplification?</li><li><strong>Logical page size:</strong> Is 8 KiB optimal, or should 4/8/16/32/64 KiB be benchmarked?</li><li><strong>Cache size:</strong> What host-cache capacity produces the useful working-set hit rate?</li><li><strong>Prefetch distance:</strong> How early can expert pages be submitted without wasting I/O?</li><li><strong>Cross-token locality:</strong> How stable are expert selections across adjacent tokens?</li><li><strong>Cross-layer locality:</strong> Can pages be retained effectively across layers?</li><li><strong>GPU interaction:</strong> Should GPU residency use the same page granularity or a different transfer unit?</li><li><strong>Compression/quantization:</strong> Does the tensor quantization format introduce useful natural I/O boundaries?</li></ol>
+
+<h2>26. Key Architectural Distinction</h2>
+<p>The most important distinction from conventional <code>mmap</code>-based paging is the location of knowledge and control.</p>
+<table><tr><th>Property</th><th>OS mmap/page cache</th><th>GGBufMoE</th></tr>
+<tr><td>Knows model semantics</td><td>No</td><td>Yes</td></tr>
+<tr><td>Knows expert identity</td><td>No</td><td>Yes</td></tr>
+<tr><td>Application-controlled residency</td><td>Limited</td><td>Explicit</td></tr>
+<tr><td>Async request scheduling</td><td>Indirect</td><td>Explicit</td></tr>
+<tr><td>Duplicate request suppression</td><td>OS-managed</td><td>Single-flight</td></tr>
+<tr><td>Expert-aware prefetch</td><td>No</td><td>Yes</td></tr>
+<tr><td>Logical page granularity</td><td>OS-defined</td><td>Configurable</td></tr>
+<tr><td>Physical read coalescing</td><td>Indirect</td><td>Explicit</td></tr>
+<tr><td>Inference-specific metrics</td><td>No</td><td>Yes</td></tr></table>
+
+<h2>27. Final Architectural Picture</h2>
+<div class="diagram">                  Qwen3.8 inference
+                         |
+                         v
+                    MoE router
+                         |
+                  (layer, expert)
+                         |
+                         v
+                  +--------------+
+                  | Expert Index |
+                  +--------------+
+                         |
+                    tensor extents
+                         |
+                         v
+                  +--------------+
+                  | Page Mapping |
+                  +--------------+
+                         |
+                  logical page IDs
+                         |
+                         v
+                  +--------------+
+                  | Page Dir/LRU |
+                  +--------------+
+                    /          \
+                 hit            miss
+                  |               |
+                  v               v
+              8 KiB page    async request
+                                  |
+                                  v
+                              GGUF file
+                                  |
+                           coalesced read
+                                  |
+                                  v
+                            host page cache
+                                  |
+                                  v
+                             GPU transfer
+                                  |
+                                  v
+                           expert computation</div>
+
+<h2>28. Success Criteria</h2>
+<p>The prototype is successful if it can demonstrate, with reproducible measurements, that explicit application-controlled paging can:</p>
+<ul><li>Correctly map Qwen3.8 expert requests to GGUF file ranges.</li><li>Maintain an explicit bounded host cache.</li><li>Issue multiple asynchronous storage operations.</li><li>Avoid duplicate reads for concurrent requests.</li><li>Coalesce adjacent logical pages when beneficial.</li><li>Prefetch pages using expert-selection information.</li><li>Produce detailed CSV performance traces.</li><li>Provide measurable page-hit and page-wait behavior that can be compared directly against the mmap baseline.</li></ul>
+
+<h2>29. Design Principle</h2>
+<p>GGBufMoE should remain a small buffer manager, not become another inference framework. The clean separation is:</p>
+<pre>GGUF model
+   |
+   +-- immutable catalog
+   |
+   +-- expert index
+   |
+   +-- page manager
+   |      |
+   |      +-- hash directory
+   |      +-- LRU buffer pool
+   |      +-- async I/O
+   |      +-- prefetch
+   |
+   +-- inference engine
+          |
+          +-- router supplies expert identities
+          +-- GEMM consumes resident expert data</pre>
+<p>That separation allows each component to be measured independently and gives the project a credible path from a standalone C experiment to an eventual llama.cpp storage backend.</p>
+<p class="small">Document: GGBufMoE Detailed Design Document. Initial prototype target: Qwen3.8 GGUF. Model-specific values are working assumptions and should be validated against the exact GGUF file before implementation decisions are frozen.</p>
+</main></body></html>
