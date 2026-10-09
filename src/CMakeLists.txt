@@ -59,6 +59,10 @@ set_target_properties(llama PROPERTIES
     UNITY_BUILD_BATCH_SIZE 16
 )
 
+if (WIN32)
+    set_target_properties(llama PROPERTIES PDB_NAME llama-lib)
+endif()
+
 # exclude non-model sources from unity build
 set_source_files_properties(${LLAMA_CORE_SOURCES} ../include/llama.h unicode.h
     PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
