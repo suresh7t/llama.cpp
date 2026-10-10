@@ -74,6 +74,29 @@ static std::string read_file(const std::string & fname) {
     return content;
 }
 
+static std::map<std::string, std::string> parse_moe_provider_args(const std::string & value) {
+    std::map<std::string, std::string> result;
+    if (value.empty()) {
+        return result;
+    }
+
+    for (const std::string & item : string_split<std::string>(value, ',')) {
+        const size_t separator = item.find('=');
+        if (separator == std::string::npos || separator == 0) {
+            throw std::runtime_error("--moe-provider-args: expected key=value entries separated by commas");
+        }
+        const std::string key = item.substr(0, separator);
+        const std::string val = item.substr(separator + 1);
+        if (val.empty()) {
+            throw std::runtime_error(string_format("--moe-provider-args: empty value for '%s'", key.c_str()));
+        }
+        if (!result.emplace(key, val).second) {
+            throw std::runtime_error(string_format("--moe-provider-args: duplicate key '%s'", key.c_str()));
+        }
+    }
+    return result;
+}
+
 static const std::vector<common_arg> & get_common_arg_defs() {
     static const std::vector<common_arg> options = [] {
         common_params params;
@@ -882,6 +905,10 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
 
     // parse all CLI args now, so that -hf is available below for remote preset resolution
     parse_cli_args();
+
+    if (params.moe_provider.empty() && !params.moe_provider_args.empty()) {
+        throw std::runtime_error("--moe-provider-args requires --moe-provider");
+    }
 
     postprocess_cpu_params(params.cpuparams,       nullptr);
     postprocess_cpu_params(params.cpuparams_batch, &params.cpuparams);
@@ -2437,6 +2464,24 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.no_host = true;
         }
     ).set_env("LLAMA_ARG_NO_HOST"));
+    add_opt(common_arg(
+        {"--moe-provider"}, "NAME",
+        "load a named MoE provider from the executable directory",
+        [](common_params & params, const std::string & value) {
+            if (value.empty()) {
+                throw std::runtime_error("--moe-provider: name must not be empty");
+            }
+            params.moe_provider = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_PROVIDER"));
+    add_opt(common_arg(
+        {"--moe-provider-args"}, "KEY=VALUE,...",
+        "arguments passed to the selected MoE provider",
+        [](common_params & params, const std::string & value) {
+            params.moe_provider_args = value;
+            params.moe_provider_params = parse_moe_provider_args(value);
+        }
+    ).set_env("LLAMA_ARG_MOE_PROVIDER_ARGS"));
     add_opt(common_arg(
         {"-ctk", "--cache-type-k"}, "TYPE",
         string_format(

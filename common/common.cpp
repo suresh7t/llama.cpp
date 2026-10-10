@@ -10,6 +10,7 @@
 #include "fit.h"
 #include "log.h"
 #include "llama.h"
+#include "moe-provider.h"
 #include "sampling.h"
 #include "speculative.h"
 #include "unicode.h"
@@ -1153,6 +1154,11 @@ struct common_init_result::impl {
 
     common_threadpools threadpools;
 
+    struct llama_model_params provider_model_params{};
+    struct llama_context_params provider_context_params{};
+    std::unique_ptr<llama_moe_provider_host_impl> provider_host;
+    common_moe_provider_state provider;
+
     llama_model_ptr   model;
     llama_context_ptr context;
 
@@ -1274,6 +1280,21 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             params.fit_params_min_ctx,
             has_draft || spec_mtp ? &extra : nullptr,
             params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+    }
+
+    if (!params.moe_provider.empty()) {
+        pimpl->provider_model_params = mparams;
+        pimpl->provider_context_params = cparams;
+        pimpl->provider_host = std::make_unique<llama_moe_provider_host_impl>(
+                params, pimpl->provider_model_params, pimpl->provider_context_params);
+
+        std::string provider_error;
+        if (!pimpl->provider.load(params.moe_provider, params.moe_provider_args,
+                                  *pimpl->provider_host, provider_error)) {
+            COM_ERR("moe-provider: %s\n", provider_error.c_str());
+            return;
+        }
+        COM_INF("moe-provider: loaded '%s'\n", params.moe_provider.c_str());
     }
 
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
@@ -1680,7 +1701,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.main_gpu        = params.main_gpu;
     mparams.split_mode      = params.split_mode;
     mparams.load_mode       = params.load_mode;
-    mparams.lazy_mode = params.lazy_mode;
+    mparams.lazy_mode       = params.lazy_mode;
     mparams.tensor_split    = params.tensor_split;
     mparams.check_tensors   = params.check_tensors;
     mparams.use_extra_bufts = !params.no_extra_bufts;

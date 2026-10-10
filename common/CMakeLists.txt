@@ -97,6 +97,8 @@ add_library(${TARGET}
     ngram-map.h
     ngram-mod.cpp
     ngram-mod.h
+    moe-provider.h
+    moe-provider.cpp
     peg-parser.cpp
     peg-parser.h
     preset.cpp
@@ -135,6 +137,7 @@ set_target_properties(${TARGET} PROPERTIES
 
 target_include_directories(${TARGET} PUBLIC .)
 target_link_libraries     (${TARGET} PUBLIC vendor::nlohmann vendor::sheredom)
+target_link_libraries     (${TARGET} PRIVATE ${CMAKE_DL_LIBS})
 target_compile_features   (${TARGET} PUBLIC cxx_std_17)
 
 if (LLAMA_SUBPROCESS)

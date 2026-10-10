@@ -127,6 +127,7 @@ option(LLAMA_SANITIZE_UNDEFINED "llama: enable undefined sanitizer" OFF)
 
 # utils
 option(LLAMA_BUILD_COMMON "llama: build common utils library" ${LLAMA_STANDALONE})
+option(LLAMA_BUILD_MOE_PROVIDER "llama: build the moe-hpcache provider module" OFF)
 
 # extra artifacts
 option(LLAMA_BUILD_TESTS     "llama: build tests"                                                                ${LLAMA_STANDALONE})
@@ -238,6 +239,10 @@ add_subdirectory(vendor)
 
 if (LLAMA_BUILD_COMMON)
     add_subdirectory(common)
+endif()
+
+if (LLAMA_BUILD_MOE_PROVIDER)
+    add_subdirectory(moe-hpcache)
 endif()
 
 if (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TESTS AND NOT CMAKE_JS_VERSION)
