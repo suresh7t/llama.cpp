@@ -317,6 +317,9 @@ extern "C" {
         ggml_backend_buffer_type_t buft;
     };
 
+    // see llama-moe-provider.h
+    struct llama_moe_provider_api;
+
     struct llama_model_params {
         // NULL-terminated list of devices to use for offloading (if NULL, all available devices are used)
         ggml_backend_dev_t * devices;
@@ -354,6 +357,10 @@ extern "C" {
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
         bool load_mtp;        // whether to load MTP layers
+
+        // optional MoE provider that replaces expert placement and scheduling, NULL uses the defaults
+        // the provider must outlive the model
+        const struct llama_moe_provider_api * moe_provider;
     };
 
     struct llama_sampler_seq_config {
