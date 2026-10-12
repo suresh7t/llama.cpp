@@ -16,6 +16,7 @@ class common_moe_hpcache_lazy_value_map {
 public:
     using load_callback = std::function<bool(const K &, V &, size_t &)>;
     using evict_callback = std::function<bool(const K &, V &)>;
+    using create_callback = std::function<V()>;
 
     explicit common_moe_hpcache_lazy_value_map(size_t budget_bytes = 0) : budget(budget_bytes) {}
 
@@ -23,6 +24,29 @@ public:
         shard & bucket = buckets[shard_for(key)];
         std::lock_guard<std::mutex> lock(bucket.mutex);
         return bucket.entries.emplace(key, entry{}).second;
+    }
+
+    bool get_registered(const K & key, V & value) const {
+        const shard & bucket = buckets[shard_for(key)];
+        std::lock_guard<std::mutex> lock(bucket.mutex);
+        auto it = bucket.entries.find(key);
+        if (it == bucket.entries.end()) {
+            return false;
+        }
+        value = it->second.value;
+        return true;
+    }
+
+    V get_or_create(const K & key, const create_callback & create) {
+        shard & bucket = buckets[shard_for(key)];
+        std::lock_guard<std::mutex> lock(bucket.mutex);
+        auto it = bucket.entries.find(key);
+        if (it == bucket.entries.end()) {
+            entry value;
+            value.value = create();
+            it = bucket.entries.emplace(key, std::move(value)).first;
+        }
+        return it->second.value;
     }
 
     bool get(const K & key, V & value) {
@@ -89,6 +113,7 @@ public:
         shard & bucket = buckets[shard_for(key)];
         std::lock_guard<std::mutex> lock(bucket.mutex);
         auto inserted = bucket.entries.emplace(key, entry{});
+        inserted.first->second.value = loaded;
         if (inserted.first->second.resident) {
             value = *inserted.first->second.resident;
             return true;
@@ -115,8 +140,18 @@ public:
         return count;
     }
 
+    void for_each_registered(const std::function<void(const K &, V &)> & callback) {
+        for (shard & bucket : buckets) {
+            std::lock_guard<std::mutex> lock(bucket.mutex);
+            for (auto & item : bucket.entries) {
+                callback(item.first, item.second.value);
+            }
+        }
+    }
+
 private:
     struct entry {
+        V value{};
         std::optional<V> resident;
         size_t bytes;
         uint64_t tick;
