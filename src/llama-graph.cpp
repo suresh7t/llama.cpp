@@ -6,6 +6,7 @@
 #include "llama-batch.h"
 #include "llama-cparams.h"
 #include "llama-sampler.h"
+#include "llama-moe-provider.h"
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -1573,6 +1574,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     moe_cache        (params.moe_cache),
     prec_policy      (params.prec_policy),
     hdmd             (params.hdmd),
+    moe_provider     (params.moe_provider),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
@@ -2315,6 +2317,38 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
 
+    // a MoE provider can compute the routed experts for single-token decode
+    // the stock path stays for anything that the provider interface does not carry
+    // the ubatch size matters, the last layer can have a single row left in a larger ubatch
+    if (moe_provider != nullptr && moe_provider->build_moe_layer != nullptr && ubatch.n_tokens == 1 && n_tokens == 1 &&
+            !weight_before_ffn && !cparams.warmup &&
+            !up_exps_b && !gate_exps_b && !down_exps_b && !gate_up_exps_b && !up_exps_s && !gate_exps_s && !down_exps_s &&
+            (loras == nullptr || loras->empty())) {
+        const llama_moe_layer_request req = {
+            /*.ctx              =*/ ctx0,
+            /*.gf               =*/ gf,
+            /*.cur              =*/ cur,
+            /*.selected_experts =*/ selected_experts,
+            /*.weights          =*/ weights,
+            /*.gate_exps        =*/ gate_exps,
+            /*.up_exps          =*/ up_exps,
+            /*.down_exps        =*/ down_exps,
+            /*.gate_up_exps     =*/ gate_up_exps,
+            /*.il               =*/ il,
+            /*.n_expert         =*/ (int32_t) n_expert,
+            /*.n_expert_used    =*/ (int32_t) n_expert_used,
+            /*.n_tokens         =*/ (int32_t) n_tokens,
+            /*.ffn_op           =*/ type_op == LLM_FFN_SILU ? LLAMA_MOE_FFN_SILU : LLAMA_MOE_FFN_OTHER,
+            /*.swiglu_clamp     =*/ il >= 0 ? hparams.swiglu_clamp_exp[il] : 0.0f,
+        };
+
+        ggml_tensor * moe_out = moe_provider->build_moe_layer(moe_provider->handle, &req);
+        if (moe_out != nullptr) {
+            ggml_build_forward_expand(gf, moe_out);
+            cb(moe_out, "ffn_moe_out", il);
+            return moe_out;
+        }
+    }
     // the experts of host-resident layers may be read from the MoE cache
     ggml_tensor * slots = build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, il);
 
