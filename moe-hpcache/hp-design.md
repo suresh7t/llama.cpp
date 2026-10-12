@@ -903,3 +903,50 @@ For autoregressive single-token decode, the next token cannot start until the cu
 
 KV ownership does not change this dependency. Attention creates the current K/V before the MoE split. CPU RAM receives or owns the authoritative copy, and the GPU updates its resident page when present. The CPU expert backend does not create a second K/V result. A later attention operation may read the new entry only after the authoritative write and required device visibility are complete.
 
+
+## 18.6 Doorbell handshake pattern
+
+The doorbell is not a CUDA or ggml term. It is the systems idiom used by NVMe, NICs and GPU command queues: one agent
+writes a request into shared memory and bumps a counter (rings the bell); the other agent notices by polling.
+
+In traditional software terms it is a **single-slot, single-producer/single-consumer mailbox with a request/response
+handshake over shared memory, where both sides poll**. It is a synchronous RPC (rendezvous), not a queue and not an
+actor system: capacity is 1, there is no buffering, no addressing, and exactly two parties.
+
+```text
+GPU (publish kernel)                 CPU follower thread
+  copy x, ids, weights -> mailbox
+  fence (system scope)
+  seq = seq + 1            ------->  spin: seq != last
+                                     serve missed experts, write y
+                                     fence
+                           <-------  flag = seq
+GPU (wait_merge kernel)
+  spin: flag != seq
+  fence, copy y -> device buffer
+```
+
+Rules:
+- `seq` is incremented in memory by the kernel, never passed as a launch argument, so a replayed CUDA graph rings a
+  fresh value. `flag == seq` means "response for this request is complete".
+- Payload is written before the fence, the counter after it; the reader fences after seeing the counter, before reading
+  the payload (release/acquire at system scope).
+- One request in flight. A layer cannot start before the previous layer's merge, so there is no queue depth to manage.
+- `decode_end` synchronizes the device once per token and disarms the follower, so no spinner outlives the step.
+
+What it removes and what it does not:
+- Removed: the per-layer device-to-host copy, stream synchronization, host launch and host-to-device copy; the graph
+  can be captured whole; no OS wakeup latency on either side.
+- Not removed: the dependency. The GPU still waits for the CPU inside `wait_merge` and the CPU for the GPU's publish;
+  the gain is that pool hits (GPU) and misses (CPU) of one layer overlap, and the handoff itself costs a cache-line
+  transfer. Spinning threads occupy cores, which is why thread count must leave spare physical cores (`-t 6` of 8).
+
+Why not an OS semaphore or event:
+- Device code cannot wait on an OS primitive. A kernel can only poll memory or use device atomics; the GPU side must
+  spin regardless.
+- The only supported GPU-to-host signals are stream callbacks / host graph nodes (driver thread, tens of microseconds,
+  cannot run on our pinned pool) and events (need a host wait, i.e. a synchronization per layer). At 48 layers per
+  token and two crossings each, that latency and its jitter on Windows would cost more than the CPU compute saved.
+- A monotonic `seq`/`flag` pair is already the semaphore semantics (post/wait with a count), minus the OS blocking.
+  The counter form also tolerates graph replay and cannot lose or duplicate a wakeup.
+- Cost of polling is accepted deliberately: CPU cores are spent on spinning in exchange for sub-microsecond handoff.
