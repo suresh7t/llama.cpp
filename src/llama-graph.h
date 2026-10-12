@@ -23,6 +23,7 @@ struct llama_prec_policy;
 struct llama_hadamard;
 
 class llama_moe_cache;
+struct llama_moe_provider_api;
 
 struct llama_memory_context_i;
 
@@ -810,6 +811,7 @@ struct llm_graph_params {
     const llama_prec_policy * prec_policy = nullptr;
 
     const llama_hadamard * hdmd = nullptr;
+    const llama_moe_provider_api * moe_provider = nullptr;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -1068,6 +1070,7 @@ struct llm_graph_context {
     const llama_prec_policy * prec_policy;
 
     const llama_hadamard * hdmd;
+    const llama_moe_provider_api * moe_provider;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
