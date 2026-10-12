@@ -112,7 +112,7 @@ struct llama_moe_host {
 
     void (*log)(void * ctx, enum ggml_log_level level, const char * message);
 
-    // --moe-provider-args entries, plus "model", "n_ctx", "ctk", "ctv", "n_gpu_layers"
+    // --moe-provider-args entries, plus "model", "n_ctx", "ctk", "ctv", "n_gpu_layers", "n_threads", "n_ubatch"
     const char * (*get_param)(void * ctx, const char * name);
 
     // fill out[] with up to cap devices and return the device count
