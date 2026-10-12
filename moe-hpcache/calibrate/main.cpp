@@ -35,6 +35,8 @@ struct expert_sample {
     size_t               ple_bytes      = 0;
     size_t               output_bytes   = 0;
     size_t               token_bytes    = 0;
+    bool                 token_on_cpu   = true;
+    double               gpu_kv_fraction = 1.0;
     int64_t              expert_slots   = 0;
     std::vector<size_t>  dense_tensor_sizes;
     std::vector<size_t>  dense_layer_sizes;
@@ -245,13 +247,14 @@ static bool load_sample(const char * path, expert_sample & sample, std::string &
             const size_t bytes = gguf_get_tensor_size(shard.get(), i);
             const bool expert = is_expert_weight(name);
             const bool ple    = name == "per_layer_token_embd.weight";
-            size_t & total = expert ? sample.expert_bytes : ple ? sample.ple_bytes : sample.dense_bytes;
+            const bool token  = name == "token_embd.weight";
+            size_t & total = expert ? sample.expert_bytes : ple ? sample.ple_bytes : token ? sample.token_bytes : sample.dense_bytes;
             if (bytes > SIZE_MAX - total) {
                 error = "model tensor size total overflows";
                 return false;
             }
             total += bytes;
-            if (ple) {
+            if (ple || token) {
                 continue;
             }
             unsigned layer = 0;
@@ -272,8 +275,6 @@ static bool load_sample(const char * path, expert_sample & sample, std::string &
                 sample.dense_tensor_sizes.push_back(bytes);
                 if (name == "output.weight") {
                     sample.output_bytes = bytes;
-                } else if (name == "token_embd.weight") {
-                    sample.token_bytes = bytes;
                 }
                 if (sscanf(name.c_str(), "blk.%u.", &layer) == 1) {
                     if (bytes > SIZE_MAX - dense_layers[layer]) {
@@ -284,6 +285,12 @@ static bool load_sample(const char * path, expert_sample & sample, std::string &
                 }
             }
         }
+    }
+    // input embedding lookups run on the CPU, unless the table is also the output head
+    sample.token_on_cpu = sample.output_bytes != 0;
+    if (!sample.token_on_cpu) {
+        sample.dense_bytes += sample.token_bytes;
+        sample.dense_tensor_sizes.push_back(sample.token_bytes);
     }
     for (const auto & entry : expert_layers) {
         if (entry.second.count > INT64_MAX - sample.expert_slots) {
@@ -522,7 +529,8 @@ static void prepare_device(device_result & result, const expert_sample & sample)
     // Free-memory and compute estimates are reported for diagnostics only.
     result.memory_available_pool = result.memory_pool;
     const auto type = ggml_backend_dev_type(result.dev);
-    result.kv_cache_bytes = type == GGML_BACKEND_DEVICE_TYPE_CPU ? result.context_bytes : result.context_bytes / 2;
+    result.kv_cache_bytes = type == GGML_BACKEND_DEVICE_TYPE_CPU ? result.context_bytes :
+        size_t(double(result.context_bytes) * sample.gpu_kv_fraction);
     result.weight_budget = result.memory_available_pool;
     const size_t required = sample.dense_bytes > SIZE_MAX - result.kv_cache_bytes ? SIZE_MAX :
         sample.dense_bytes + result.kv_cache_bytes;
@@ -740,14 +748,16 @@ static bool write_json(const char *                       path,
     out << "  \"cache_type_v\": \"" << ggml_type_name(type_v) << "\",\n";
     out << "  \"working_memory_placement\": \"full_layers_per_backend_probe\",\n";
     out << "  \"memory_pool_fraction\": 0.80,\n";
-    out << "  \"gpu_kv_cache_fraction\": 0.50,\n";
+    char kv_fraction[32];
+    snprintf(kv_fraction, sizeof(kv_fraction), "%.2f", sample.gpu_kv_fraction);
+    out << "  \"gpu_kv_cache_fraction\": " << kv_fraction << ",\n";
     out << "  \"cpu_kv_cache_fraction\": 1.00,\n";
     out << "  \"cpu_kv_authoritative\": true,\n";
     out << "  \"gpu_dense_weights_required\": true,\n";
     out << "  \"placement_policy\": \"ranked_capacity_with_cpu_fallback\",\n";
     out << "  \"tensor_count\": " << sample.n_tensors << ",\n";
     out << "  \"expert_weight_bytes\": " << sample.expert_bytes << ",\n";
-    out << "  \"other_weight_bytes\": " << sample.dense_bytes + sample.ple_bytes << ",\n";
+    out << "  \"other_weight_bytes\": " << sample.dense_bytes + sample.ple_bytes + (sample.token_on_cpu ? sample.token_bytes : 0) << ",\n";
     out << "  \"dense_weight_bytes\": " << sample.dense_bytes << ",\n";
     out << "  \"ple_table_weight_bytes\": " << sample.ple_bytes << ",\n";
     out << "  \"output_head_weight_bytes\": " << sample.output_bytes << ",\n";
@@ -818,9 +828,18 @@ int main(int argc, char ** argv) {
     bool         context_explicit = false;
     ggml_type    type_k = GGML_TYPE_F16;
     ggml_type    type_v = GGML_TYPE_F16;
+    double       kv_fraction = 1.0;
+    static const char * usage = "usage: %s -m model.gguf [-o hpcache-calibration.json] [-ctx tokens|128kib] [-ctk f16|q5_0] [-ctv f16|q5_0] [-kvf 0.0-1.0]\n";
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) {
             model = argv[++i];
+        } else if (strcmp(argv[i], "-kvf") == 0 && i + 1 < argc) {
+            char * end = nullptr;
+            kv_fraction = strtod(argv[++i], &end);
+            if (end == argv[i] || *end != '\0' || !(kv_fraction > 0.0 && kv_fraction <= 1.0)) {
+                fprintf(stderr, "calibration: -kvf must be in (0, 1]\n");
+                return 1;
+            }
         } else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
             output = argv[++i];
         } else if (strcmp(argv[i], "-ctx") == 0 && i + 1 < argc) {
@@ -850,12 +869,12 @@ int main(int argc, char ** argv) {
                 return 1;
             }
         } else {
-            fprintf(stderr, "usage: %s -m model.gguf [-o hpcache-calibration.json] [-ctx tokens|128kib] [-ctk f16|q5_0] [-ctv f16|q5_0]\n", argv[0]);
+            fprintf(stderr, usage, argv[0]);
             return 1;
         }
     }
     if (!model) {
-        fprintf(stderr, "usage: %s -m model.gguf [-o hpcache-calibration.json] [-ctx tokens|128kib] [-ctk f16|q5_0] [-ctv f16|q5_0]\n", argv[0]);
+        fprintf(stderr, usage, argv[0]);
         return 1;
     }
     expert_sample sample;
@@ -864,6 +883,7 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "calibration: %s\n", error.c_str());
         return 1;
     }
+    sample.gpu_kv_fraction = kv_fraction;
     if (context_explicit) {
         sample.context_tokens = context_tokens;
     }
