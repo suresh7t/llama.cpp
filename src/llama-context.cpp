@@ -11,6 +11,7 @@
 #include "llama-model.h"
 #include "llama-moe-cache.h"
 #include "llama-ext.h"
+#include "llama-moe-provider.h"
 #include "llama-sampler.h"
 #include "llama.h"
 
@@ -1567,7 +1568,22 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    const llama_moe_provider_api * moe_provider = model.moe_provider();
+    if (moe_provider != nullptr && moe_provider->decode_begin != nullptr) {
+        const llama_moe_decode_info info = {
+            /*.n_tokens =*/ (int32_t) ubatch.n_tokens,
+            /*.n_layer  =*/ (int32_t) model.hparams.n_layer_all,
+            /*.seq_id   =*/ ubatch.n_seqs_unq == 1 ? (int32_t) ubatch.seq_id_unq[0] : -1,
+        };
+        moe_provider->decode_begin(moe_provider->handle, &info);
+    }
+
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+
+    if (moe_provider != nullptr && moe_provider->decode_end != nullptr) {
+        moe_provider->decode_end(moe_provider->handle);
+    }
+
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -2702,6 +2718,7 @@ llm_graph_params llama_context::graph_params(
         /*.moe_cache   =*/ moe_cache.get(),
         /*.prec_policy =*/ &model.prec_policy,
         /*.hdmd        =*/ model.hdmd.rot.empty() ? nullptr : &model.hdmd,
+        /*.moe_provider =*/ model.moe_provider(),
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
