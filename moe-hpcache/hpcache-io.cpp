@@ -41,6 +41,7 @@ struct common_moe_hpcache_io::impl {
     }
 };
 
+common_moe_hpcache_io::common_moe_hpcache_io() = default;
 common_moe_hpcache_io::~common_moe_hpcache_io() = default;
 
 void common_moe_hpcache_io::open(const std::string & path) {

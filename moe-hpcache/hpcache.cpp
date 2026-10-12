@@ -131,7 +131,7 @@ common_moe_hpcache_plan common_moe_hpcache_parse_plan(const common_json & plan) 
     require_plan_field("schema_version", result.schema_version == 1);
     require_plan_field("context_tokens", result.context_tokens > 0);
     require_plan_field("memory_pool_fraction", result.memory_pool_fraction == 0.80);
-    require_plan_field("gpu_kv_cache_fraction", result.gpu_kv_cache_fraction == 0.50);
+    require_plan_field("gpu_kv_cache_fraction", result.gpu_kv_cache_fraction > 0.0 && result.gpu_kv_cache_fraction <= 1.0);
     require_plan_field("cpu_kv_cache_fraction", result.cpu_kv_cache_fraction == 1.00);
     require_plan_field("ple_resident_fraction", result.ple_resident_fraction >= 0.0 && result.ple_resident_fraction <= 1.0);
 

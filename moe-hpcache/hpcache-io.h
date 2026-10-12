@@ -7,7 +7,7 @@
 
 class common_moe_hpcache_io {
 public:
-    common_moe_hpcache_io() = default;
+    common_moe_hpcache_io();
     ~common_moe_hpcache_io();
 
     common_moe_hpcache_io(const common_moe_hpcache_io &) = delete;
