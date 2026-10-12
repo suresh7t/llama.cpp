@@ -680,6 +680,10 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
         return (void *)ggml_backend_cpu_set_use_ref;
     }
 
+    if (strcmp(name, "ggml_get_type_traits_cpu") == 0) {
+        return (void *)ggml_get_type_traits_cpu;
+    }
+
     // threadpool - TODO:  move to ggml-base
     if (strcmp(name, "ggml_threadpool_new") == 0) {
         return (void *)ggml_threadpool_new;

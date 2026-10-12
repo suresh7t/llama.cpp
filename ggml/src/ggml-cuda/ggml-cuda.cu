@@ -2197,8 +2197,21 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         nb1, nb2, nb3, stream);
 }
 
+static void ggml_cuda_op_custom(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    ggml_custom_op_params params;
+    memcpy(&params, dst->op_params, sizeof(params));
+
+    params.stream = ctx.stream();
+    memcpy(dst->op_params, &params, sizeof(params));
+
+    params.fun(dst, 0, 1, params.userdata);
+}
+
 static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
     switch (dst->op) {
+        case GGML_OP_CUSTOM:
+            ggml_cuda_op_custom(ctx, dst);
+            break;
         case GGML_OP_ARGMAX:
             ggml_cuda_argmax(ctx, dst);
             break;
@@ -5751,6 +5764,11 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_COS:
         case GGML_OP_LOG:
             return true;
+        case GGML_OP_CUSTOM: {
+            ggml_custom_op_params params;
+            memcpy(&params, op->op_params, sizeof(params));
+            return (params.flags & GGML_CUSTOM_OP_FLAG_BACKEND_STREAM) != 0;
+        }
         case GGML_OP_SCALE:
             return (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_BF16) && op->type == op->src[0]->type;
         case GGML_OP_CLAMP:

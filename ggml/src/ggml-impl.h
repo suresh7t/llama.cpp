@@ -200,10 +200,14 @@ struct ggml_map_custom3_op_params {
     void            * userdata;
 };
 
+#define GGML_CUSTOM_OP_FLAG_BACKEND_STREAM 1
+
 struct ggml_custom_op_params {
     ggml_custom_op_t fun;
     int              n_tasks;
     void           * userdata;
+    int              flags;
+    void           * stream; // set by the backend right before fun is called
 };
 
 // bitset
