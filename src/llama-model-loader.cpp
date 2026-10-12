@@ -1260,8 +1260,11 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             }
         }
 
+        const auto provider_it = provider_buft_lists.find(tn.str());
+        const bool provider_placed = !buft && provider_it != provider_buft_lists.end();
+
         if (!buft) {
-            buft = select_weight_buft(hparams, t_meta, op, buft_list);
+            buft = select_weight_buft(hparams, t_meta, op, provider_placed ? provider_it->second : buft_list);
             if (!buft) {
                 throw std::runtime_error(format("failed to find a compatible buffer type for tensor %s", tn.str().c_str()));
             }
@@ -1277,7 +1280,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             buft = ggml_backend_dev_buffer_type(cpu_dev);
         }
 
-        if (buft != buft_list->front().second) {
+        if (!provider_placed && buft != buft_list->front().second) {
             if (n_tensors_moved == 0) {
                 first_tensor_moved_name = t_meta->name;
                 first_tensor_moved_type_name = ggml_type_name(t_meta->type);
