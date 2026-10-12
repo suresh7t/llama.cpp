@@ -1,5 +1,7 @@
 #include "moe-provider.h"
 
+#include <algorithm>
+
 #include "common.h"
 #include "log.h"
 
@@ -100,11 +102,18 @@ const char * common_moe_provider::get_param(void * ctx, const char * name) {
     return it != values.end() ? it->second.c_str() : nullptr;
 }
 
-int32_t common_moe_provider::get_devices(void *, llama_moe_device_info * out, int32_t cap) {
+// The devices this run uses: every device that is not a GPU, and the GPUs of --device (all GPUs without it).
+// A GPU that was not selected is not queried either, which would create a context on it.
+int32_t common_moe_provider::get_devices(void * ctx, llama_moe_device_info * out, int32_t cap) {
+    const auto * self = static_cast<const common_moe_provider *>(ctx);
     const size_t count = ggml_backend_dev_count();
     int32_t n = 0;
     for (size_t i = 0; i < count && n < cap; ++i) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (self != nullptr && !self->selected_devices.empty() && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU &&
+                std::find(self->selected_devices.begin(), self->selected_devices.end(), dev) == self->selected_devices.end()) {
+            continue;
+        }
         llama_moe_device_info & info = out[n++];
         info.index = static_cast<int32_t>(i);
         info.dev   = dev;
@@ -151,6 +160,13 @@ bool common_moe_provider::load(const common_params & params, std::string & error
         return false;
     }
 
+    selected_devices.clear();
+    for (ggml_backend_dev_t dev : params.devices) {
+        if (dev != nullptr) {
+            selected_devices.push_back(dev);
+        }
+    }
+
     values = params.moe_provider_params;
     values["model"]         = params.model.path;
     values["n_ctx"]         = std::to_string(params.n_ctx);
@@ -158,6 +174,7 @@ bool common_moe_provider::load(const common_params & params, std::string & error
     values["ctv"]           = ggml_type_name(params.cache_type_v);
     values["n_gpu_layers"]  = std::to_string(params.n_gpu_layers);
     values["n_threads"]     = std::to_string(params.cpuparams.n_threads);
+    values["n_ubatch"]      = std::to_string(params.n_ubatch);
 
     host = {};
     host.abi_version = LLAMA_MOE_ABI_VERSION;
