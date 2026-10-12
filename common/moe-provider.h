@@ -4,6 +4,7 @@
 
 #include <map>
 #include <string>
+#include <vector>
 
 struct common_params;
 
@@ -27,6 +28,9 @@ private:
 
     llama_moe_host host{};
     std::map<std::string, std::string> values;
+
+    // the devices selected with --device, empty when the model may use all of them
+    std::vector<ggml_backend_dev_t> selected_devices;
 
     void * module = nullptr;
     const llama_moe_provider_api * provider = nullptr;
