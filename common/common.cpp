@@ -1154,10 +1154,8 @@ struct common_init_result::impl {
 
     common_threadpools threadpools;
 
-    struct llama_model_params provider_model_params{};
-    struct llama_context_params provider_context_params{};
-    std::unique_ptr<llama_moe_provider_host_impl> provider_host;
-    common_moe_provider_state provider;
+    // declared before the model, so that it is destroyed after it
+    common_moe_provider provider;
 
     llama_model_ptr   model;
     llama_context_ptr context;
@@ -1248,6 +1246,17 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
+    // loaded before the fit, so that the fit sees the provider placement
+    if (!params.moe_provider.empty()) {
+        std::string provider_error;
+        if (!pimpl->provider.load(params, provider_error)) {
+            COM_ERR("moe-provider: %s\n", provider_error.c_str());
+            return;
+        }
+        COM_INF("moe-provider: loaded '%s'\n", params.moe_provider.c_str());
+        mparams.moe_provider = pimpl->provider.api();
+    }
+
     if (params.fit_params) {
         COM_TRC("%s", "fitting params to device memory ...\n");
         COM_TRC("%s", "(for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)\n");
@@ -1280,21 +1289,6 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             params.fit_params_min_ctx,
             has_draft || spec_mtp ? &extra : nullptr,
             params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
-    }
-
-    if (!params.moe_provider.empty()) {
-        pimpl->provider_model_params = mparams;
-        pimpl->provider_context_params = cparams;
-        pimpl->provider_host = std::make_unique<llama_moe_provider_host_impl>(
-                params, pimpl->provider_model_params, pimpl->provider_context_params);
-
-        std::string provider_error;
-        if (!pimpl->provider.load(params.moe_provider, params.moe_provider_args,
-                                  *pimpl->provider_host, provider_error)) {
-            COM_ERR("moe-provider: %s\n", provider_error.c_str());
-            return;
-        }
-        COM_INF("moe-provider: loaded '%s'\n", params.moe_provider.c_str());
     }
 
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
