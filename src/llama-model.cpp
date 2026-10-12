@@ -20,6 +20,7 @@
 #include "llama-memory-recurrent.h"
 
 #include "llama.h"
+#include "llama-moe-provider.h"
 #include "models/models.h"
 
 #include "ggml.h"
@@ -29,6 +30,7 @@
 #include <cassert>
 #include <cfloat>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <cmath>
 #include <functional>
@@ -1687,6 +1689,88 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     // assign the output layer
     pimpl->dev_output = get_layer_buft_list(n_layer_all);
+
+    // let the MoE provider choose where tensors go
+    if (params.moe_provider != nullptr && params.moe_provider->place != nullptr) {
+        std::vector<llama_moe_device_info> moe_devices;
+        std::vector<const buft_list_t *>   moe_buft_lists;
+
+        auto add_moe_device = [&](ggml_backend_dev_t dev, const buft_list_t * buft_list) {
+            llama_moe_device_info info = {};
+            info.index = (int32_t) moe_devices.size();
+            info.dev   = dev;
+            info.name  = ggml_backend_dev_name(dev);
+            info.type  = ggml_backend_dev_type(dev);
+            ggml_backend_dev_memory(dev, &info.mem_free, &info.mem_total);
+            moe_devices.push_back(info);
+            moe_buft_lists.push_back(buft_list);
+        };
+        add_moe_device(cpu_dev, &pimpl->cpu_buft_list);
+        for (const auto & dev : devices) {
+            add_moe_device(dev.dev, &pimpl->gpu_buft_list.at(dev.dev));
+        }
+
+        std::vector<llama_moe_tensor_desc> moe_tensors;
+        moe_tensors.reserve(ml.weights_map.size());
+        for (const auto & it : ml.weights_map) {
+            const std::string & name = it.first;
+            const ggml_tensor * t = it.second.tensor;
+
+            llama_moe_tensor_desc desc = {};
+            desc.name   = name.c_str();
+            desc.layer  = -1;
+            sscanf(name.c_str(), "blk.%d.", &desc.layer);
+            desc.type   = t->type;
+            desc.nbytes = ggml_nbytes(t);
+            desc.file_index  = it.second.idx;
+            desc.file_offset = it.second.offs;
+            for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+                desc.ne[i] = t->ne[i];
+            }
+
+            const bool is_expert = hparams.n_expert > 0 && t->ne[2] == (int64_t) hparams.n_expert && t->ne[3] == 1 &&
+                name.find("_exps.") != std::string::npos;
+            if (is_expert) {
+                desc.kind = name.find("gate_up_exps") != std::string::npos ? LLAMA_MOE_TENSOR_EXPERT_GATE_UP :
+                            name.find("gate_exps")    != std::string::npos ? LLAMA_MOE_TENSOR_EXPERT_GATE :
+                            name.find("up_exps")      != std::string::npos ? LLAMA_MOE_TENSOR_EXPERT_UP :
+                            LLAMA_MOE_TENSOR_EXPERT_DOWN;
+                desc.n_expert      = (int32_t) hparams.n_expert;
+                desc.expert_nbytes = desc.nbytes / hparams.n_expert;
+            } else if (name == "per_layer_token_embd.weight") {
+                desc.kind = LLAMA_MOE_TENSOR_PLE;
+            } else {
+                desc.kind = desc.layer >= 0 ? LLAMA_MOE_TENSOR_DENSE : LLAMA_MOE_TENSOR_OTHER;
+            }
+            moe_tensors.push_back(desc);
+        }
+
+        std::vector<llama_moe_tensor_home> homes(moe_tensors.size()); // zero is DEFAULT
+        params.moe_provider->place(params.moe_provider->handle, moe_devices.data(), (int32_t) moe_devices.size(),
+                moe_tensors.data(), (int32_t) moe_tensors.size(), homes.data());
+
+        std::vector<size_t> placed_count(moe_devices.size(), 0);
+        std::vector<size_t> placed_bytes(moe_devices.size(), 0);
+        for (size_t i = 0; i < homes.size(); ++i) {
+            if (homes[i].kind != LLAMA_MOE_HOME_DEVICE) {
+                continue;
+            }
+            if (homes[i].device < 0 || (size_t) homes[i].device >= moe_devices.size()) {
+                LLAMA_LOG_WARN("%s: provider placed tensor %s on an invalid device %d, using the default\n",
+                        __func__, moe_tensors[i].name, homes[i].device);
+                continue;
+            }
+            ml.provider_buft_lists[moe_tensors[i].name] = moe_buft_lists[homes[i].device];
+            placed_count[homes[i].device]++;
+            placed_bytes[homes[i].device] += moe_tensors[i].nbytes;
+        }
+        for (size_t i = 0; i < moe_devices.size(); ++i) {
+            if (placed_count[i] > 0) {
+                LLAMA_LOG_INFO("%s: MoE provider placed %zu tensors (%zu MiB) on %s\n",
+                        __func__, placed_count[i], placed_bytes[i] / 1024 / 1024, moe_devices[i].name);
+            }
+        }
+    }
 
     const auto TENSOR_NOT_REQUIRED = llama_model_loader::TENSOR_NOT_REQUIRED;
 
@@ -3360,6 +3444,7 @@ llama_model_params llama_model_default_params() {
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
         /*.load_mtp                    =*/ false,
+        /*.moe_provider                =*/ nullptr,
     };
 
     return result;
