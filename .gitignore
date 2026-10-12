@@ -155,4 +155,4 @@ AGENTS.local.md
 .pi/SYSTEM.md
 
 cmake-build-debug-visual-studio/
-blddbg-vs/
+dbgbld-vs/
