@@ -19,3 +19,19 @@ The JSON separates expert weights, the `per_layer_token_embd.weight` PLE table, 
 The measurement uses one matrix from one layer; a full MoE layer has other operations and synchronization costs. Compare the proposed split with full model decoding before using it as a placement policy.
 
 CUDA and Vulkan entries with the same PCI device ID are two backend views of one physical device. The calibration JSON reports both measurements, but capacity and active-work assignment use one owner backend per physical device and do not add the two memory pools together. `benchmark_active_experts` describes the measured active-work split; it is not an expert residency map.
+
+## Host arena probe
+
+Before the backends are loaded the tool commits a region of host memory (up to the expert weight size, and no more than
+the available RAM minus `-arena-headroom-gib`, default 12), registers it with CUDA in 256 MiB slices for the largest GPU,
+copies 4 MiB pieces out of it to the device, and releases it. The result is the `host_arena` object of the JSON:
+`registered_bytes` (the proven limit, 0 when copies from the registered memory fail), `recommended_bytes` (the smaller of
+that and the expert weights) and `h2d_gb_per_s`. Pass `-no-arena` to skip it. It runs before any other backend query on
+purpose: a CUDA context on a second GPU makes registrations of this size fail.
+
+## Expert split
+
+When the host arena probe worked, the JSON also has `expert_split`: `cpu_gb_per_s` (the CPU backend's time for one
+expert matrix of the sample tensor), `pcie_gb_per_s` (the copy rate out of the locked region), `pcie_frac` (the share of
+the missed experts the GPU takes, `pcie / (pcie + cpu)`, between 0.1 and 0.8) and `pcie_max` (experts of the GPU path per
+layer). The provider uses them as the start values and adjusts the share while it runs.
