@@ -74,6 +74,15 @@ struct common_moe_hpcache_device {
     uint64_t    kv_cache_bytes = 0;
 };
 
+// measured by the calibration tool: the CPU's and the PCIe link's rate for expert bytes, and the split derived from it
+struct common_moe_hpcache_expert_split {
+    bool   present = false;
+    double cpu_gb_per_s = 0.0;
+    double pcie_gb_per_s = 0.0;
+    double pcie_frac = 0.0;
+    int    pcie_max = 0;
+};
+
 struct common_moe_hpcache_plan {
     int32_t     schema_version = 0;
     std::string model;
@@ -92,6 +101,7 @@ struct common_moe_hpcache_plan {
     uint64_t    ple_weight_bytes = 0;
     uint64_t    expert_weight_bytes = 0;
     double      ple_resident_fraction = 0.30;
+    common_moe_hpcache_expert_split expert_split;
     std::vector<common_moe_hpcache_device> devices;
 };
 
