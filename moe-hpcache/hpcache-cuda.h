@@ -56,6 +56,19 @@ int32_t * hpcache_cuda_table_alloc(int n_expert);
 void      hpcache_cuda_table_free(int32_t * table);
 bool      hpcache_cuda_table_upload(int32_t * table, const int32_t * host, int n_expert);
 
+// The slot tables of all layers live in one device array (table i at d + i * n_expert) with a pinned host mirror, so a
+// round of admission changes them with one copy instead of one per layer.
+struct hpcache_table_block {
+    int32_t * d = nullptr;
+    int32_t * h = nullptr;
+    int       n_tables = 0;
+    int       n_expert = 0;
+};
+bool hpcache_cuda_tables_alloc(hpcache_table_block & b, int n_tables, int n_expert);
+void hpcache_cuda_tables_free(hpcache_table_block & b);
+// copy the first n_tables tables of the mirror to the device
+bool hpcache_cuda_tables_upload(const hpcache_table_block & b, int n_tables);
+
 // queued host -> device copy on a private stream, hpcache_cuda_copy_wait returns when all have landed
 bool hpcache_cuda_copy_to_device(void * dst, const void * src, size_t nbytes);
 bool hpcache_cuda_copy_wait();

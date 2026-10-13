@@ -179,6 +179,45 @@ bool hpcache_cuda_table_upload(int32_t * table, const int32_t * host, int n_expe
     return cudaMemcpy(table, host, size_t(n_expert) * sizeof(int32_t), cudaMemcpyHostToDevice) == cudaSuccess;
 }
 
+bool hpcache_cuda_tables_alloc(hpcache_table_block & b, int n_tables, int n_expert) {
+    const size_t bytes = size_t(n_tables) * size_t(n_expert) * sizeof(int32_t);
+    void * d = nullptr;
+    void * hh = nullptr;
+    if (cudaMalloc(&d, bytes) != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    if (cudaHostAlloc(&hh, bytes, cudaHostAllocDefault) != cudaSuccess) {
+        cudaGetLastError();
+        cudaFree(d);
+        return false;
+    }
+    memset(hh, 0xff, bytes);   // -1: not resident
+    cudaMemcpy(d, hh, bytes, cudaMemcpyHostToDevice);
+    b.d = static_cast<int32_t *>(d);
+    b.h = static_cast<int32_t *>(hh);
+    b.n_tables = n_tables;
+    b.n_expert = n_expert;
+    return true;
+}
+
+void hpcache_cuda_tables_free(hpcache_table_block & b) {
+    if (b.d != nullptr) {
+        cudaFree(b.d);
+    }
+    if (b.h != nullptr) {
+        cudaFreeHost(b.h);
+    }
+    b = hpcache_table_block();
+}
+
+bool hpcache_cuda_tables_upload(const hpcache_table_block & b, int n_tables) {
+    if (b.d == nullptr || n_tables <= 0 || n_tables > b.n_tables) {
+        return false;
+    }
+    return cudaMemcpy(b.d, b.h, size_t(n_tables) * size_t(b.n_expert) * sizeof(int32_t), cudaMemcpyHostToDevice) == cudaSuccess;
+}
+
 static cudaStream_t copy_stream() {
     static cudaStream_t s = nullptr;
     if (s == nullptr && cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking) != cudaSuccess) {
