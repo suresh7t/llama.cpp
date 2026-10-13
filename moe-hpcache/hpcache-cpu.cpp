@@ -267,8 +267,10 @@ static void quantize_q8_0_with_sums(const float * x, void * y, int64_t k) {
     }
 }
 
-// q2_0 x q8_0 with the VNNI/VBMI instructions on 256-bit vectors (512-bit ones were slower here: the core drops
-// its clock, which also slows the next layer). The activation row comes from quantize_q8_0_with_sums.
+// q2_0 x q8_0 with the VNNI/VBMI instructions on 256-bit vectors. A 512-bit version measured 8-9% slower on the
+// i7-11700F (down 129 vs 119 us, gate/up 414 vs 394 us per layer and thread), so it was dropped; the cause was not
+// measured (this core has one 512-bit unit, and the kernel is bound by memory bandwidth).
+// The activation row comes from quantize_q8_0_with_sums.
 HPCACHE_VBMI static void dot_q2_0_q8_0_ymm(int n, float * s, size_t, const void * vx, size_t, const void * vy, size_t, int) {
     struct blk2 { uint16_t d; uint8_t qs[16]; };
     const blk2 *    x    = static_cast<const blk2 *>(vx);
