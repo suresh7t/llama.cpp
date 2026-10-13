@@ -17,6 +17,32 @@ These notes apply to work in `moe-hpcache/`. Follow the repository root `AGENTS.
 - `src/llama-context.cpp` builds and reserves graphs, configures the backend scheduler, and submits graphs for execution.
 - `ggml/src/ggml-backend.cpp` assigns graph nodes to backends, splits graphs, copies cross-backend inputs, and computes the splits.
 
+## Standalone tests and scratch scripts
+
+Everything that is not part of the fork (micro benchmarks, simulators, run and sweep scripts, test prompts, traces,
+logs) lives outside the repository in `C:\Users\suresh\devspace\claude`, one folder per tool or study. Do not put
+such files in the repository, in the system temp directory, or in the session scratchpad. Index: `README.md` there.
+
+- `mbw`: CMake project for the memory bandwidth tool (`membw.cpp`); build in a new directory, `b` holds a stale cache.
+- `hpcache-bench`: run and sweep scripts (`run3.ps1`, `kvtype.ps1`, `kvx.ps1`, `ubsweep.ps1`, `spare_ab.ps1`), the
+  admission simulators (`sim2.py` to `sim4.py`, `sw4.py`; run from that folder), the 16K test prompt, routing traces,
+  and `logs/` with the `.out`/`.err` of earlier runs.
+
+## Expert arena (hpcache-arena)
+
+The provider reads the expert tensors from the GGUF itself (unbuffered, 2 MiB requests) into one page-locked region and
+repoints the expert tensors' `data` at it in `make_layer`. The core's mapping is not used for experts afterwards. Keep
+the pointers valid for the life of the decoder, and do not register host memory with a second GPU context alive (limit
+about 25 GiB, then CUDA allocations fail). Numbers: BASELINES.md, "Expert arena in the provider".
+
+## GPU path for missed experts
+
+The decode graph of a layer fetches a share of the missed experts from the page-locked arena into device staging
+slots (kernel read through PCIe) and computes them on the GPU while the CPU computes the others. The device and the host
+must apply the same selection rule (see BASELINES.md, "GPU path for missed experts"); change both together. Staging
+slots are shared by all layers and are safe because a layer's staged compute precedes the next layer's publish on the
+stream. Unused slots must be zeroed.
+
 ## Constraints to check before implementation
 
 - Expert IDs are graph values produced by routing at execution time. Graph construction alone does not reveal which experts a token will use.
@@ -49,8 +75,10 @@ These are set by the project owner. Do not change them without asking.
 ## Milestones
 
 - M1a: CPU + CUDA expert dispatch and merge, single-sequence decode, stock GPU KV cache, on a context where full KV fits.
-- M1b: paged KV (CPU authoritative copy, bounded GPU page pool) for long context.
-- M2: Vulkan and multi-backend in one layer, and batched decode.
+- M1b: paged KV (CPU authoritative copy, bounded GPU page pool) for long context, only when contexts of 128K and more
+  are needed. Compressed KV types such as TurboQuant are dropped: the speed comes from the expert path, not the KV.
+- M2: Vulkan and multi-backend in one layer, and batched decode (verify windows for MTP speculative decoding, which the
+  base already has: the largest remaining decode lever, Strata 21.7 -> 29.7 t/s).
 - M3: reference-implementation refactor. Merge `include/llama-moe-provider.h` (C ABI) and `common/moe-provider.{h,cpp}` (loader):
   move library loading into libllama behind a small C API (open by name and args, close), so `llama_model_params` carries
   the name and args instead of a pointer, the loader class in `common/` disappears, and the stock path becomes the first
@@ -66,8 +94,22 @@ State: stage 4a doorbell decode works and is verified (8.3 t/s vs stock 7.6, pla
    Remaining gap to 20 t/s: CPU experts 52 ms (Strata ~20 ms for ~5 experts/layer, ours ~1.1 ms/layer for ~6.8) and ~21 ms other.
 3. Next, in order of expected gain:
    Stage 4c done: own CPU expert kernel + AVX2/VNNI q2_0 dot: 20.2 t/s (goal reached on one prompt).
+   Stage 4d done (BASELINES.md): swaps queued to a copier thread and mapped one step later, `max_swaps` default 24:
+   20.2 t/s at `-c 65536 -ctk q5_0`, 22.0 t/s at `-c 32768 -ctk q8_0 -ub 128` with `reserve_mib=700` (Strata 21.7).
+   Rejected with data: iq2_xxs AVX512 gather / mask-sign dots (slower), prefetch distance and hint changes (no
+   effect), pinning the expert tensors in place (driver limit about 27 GiB).
+   Reserve is now derived from `-ub` (`450 + 1.6 * n_ubatch` MiB) unless `reserve_mib` is given.
+   Stage 4e done: q2_0 down dot on 256-bit VBMI/VNNI with per-activation side data (0.046 -> 0.022 us/row):
+   21.9-22.0 t/s at `-c 32768 -ctk q8_0 -ub 128 reserve_mib=700`, 128 tokens (Strata no drafts 21.74).
+   Long-session profile (BASELINES.md, 2026-10-12): 31.7K tokens through llama-server at 17.3 t/s average; the only
+   thing that degrades is GPU-side "other" time, +0.36 ms per 1000 tokens of context (linear), about 13x the K/V
+   bandwidth floor. Next: compare KV types (q5_0/q8_0/q4_0/f16) at 16K context to see whether the cost is the
+   single-token FlashAttention dequant (core kernel) or the graph around it; scratchpad `kvtype.ps1` + `long_prompt.txt`.
+   - Open: a spare slot per layer so a replaced expert keeps serving while its copy is in flight (about 4-5 points of
+     hit rate); multi-prompt validation (single-prompt numbers move by about 1 t/s with the slot count); the gate/up phase (394 us/layer) is the largest remaining CPU part.
    - Validate on the long LRU-cache prompts and a second layer mix (other types may also lack an AVX2 dot).
-   - gate/up phase (390 us/layer) is now the largest CPU part; more pool slots (compute-buffer-aware reserve, calibrator fix).
+   - gate/up phase (390 us/layer) is the largest CPU part but near its load-port limit (see BASELINES.md); more pool slots
+     (compute-buffer-aware reserve from `-ub`, calibrator fix).
    - q2_0 AVX2 dot could be contributed to ggml-cpu arch/x86/quants.c; it lives in the provider for now.
    - GPU expert pool (stage 4b): profile-ranked admission, used-bytes counter, +/-10% plan tolerance, live-free-memory guard.
    - Replay-safe custom ops so CUDA graphs stay enabled.
