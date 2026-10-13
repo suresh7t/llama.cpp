@@ -29,6 +29,8 @@ if (GGML_CUDA)
         find_package(CUDAToolkit REQUIRED)
         set(HPCACHE_WITH_CUDA ON)
         list(APPEND HPCACHE_SOURCES
+            hpcache-arena.cpp
+            hpcache-arena.h
             hpcache-cuda.cu
             hpcache-cuda.h
             hpcache-cpu.cpp
