@@ -8,6 +8,9 @@
 #include <cstring>
 
 static std::atomic<int64_t> g_ns_b{0}, g_ns_c{0}, g_ns_d{0}, g_runs{0};
+// HPCACHE_PHASES: time summed over all threads: 0 wake delay, 1 gate/up, 2 wait, 3 quantize, 4 wait, 5 down, 6 wait, 7 reduce
+static const bool g_tm = getenv("HPCACHE_PHASES") != nullptr;
+static std::atomic<int64_t> g_ph[8];
 static inline int64_t now_ns() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
@@ -32,6 +35,7 @@ struct hpcache_cpu_pool::task {
     uint8_t *       actq    = nullptr;
     float *         part    = nullptr;
 
+    int64_t t_start = 0;
     std::atomic<int> next_b{0};
     std::atomic<int> next_d{0};
 };
@@ -47,6 +51,10 @@ hpcache_cpu_pool::~hpcache_cpu_pool() {
         fprintf(stderr, "hpcache cpu pool: %lld runs, gate/up %.1f us, quantize %.1f us, down %.1f us per run\n",
                 (long long) g_runs.load(), g_ns_b.load() / 1e3 / g_runs.load(), g_ns_c.load() / 1e3 / g_runs.load(),
                 g_ns_d.load() / 1e3 / g_runs.load());
+        const double k = 1e-3 / double(g_runs.load()) / n_threads;
+        fprintf(stderr, "hpcache cpu pool per thread and run, us: wake %.1f | gate/up work %.1f wait %.1f | quantize %.1f wait %.1f |"
+                " down work %.1f wait %.1f | reduce %.1f\n", g_ph[0] * k, g_ph[1] * k, g_ph[2] * k, g_ph[3] * k, g_ph[4] * k,
+                g_ph[5] * k, g_ph[6] * k, g_ph[7] * k);
     }
     quit.store(true);
     {
@@ -203,6 +211,97 @@ HPCACHE_VNNI static void dot_q2_0_q8_0_vnni(int n, float * s, size_t, const void
     r = _mm_add_ss(r, _mm_shuffle_ps(r, r, 1));
     *s = _mm_cvtss_f32(r);
 }
+
+
+#if defined(__GNUC__)
+#define HPCACHE_VBMI __attribute__((target("avx2,fma,f16c,avx512f,avx512bw,avx512vl,avx512vnni,avx512vbmi")))
+#else
+#define HPCACHE_VBMI
+#endif
+
+static bool cpu_has_vbmi_vnni() {
+#if defined(__GNUC__)
+    return __builtin_cpu_supports("avx512vnni") && __builtin_cpu_supports("avx512vbmi") &&
+            __builtin_cpu_supports("avx512bw") && __builtin_cpu_supports("avx512vl") && cpu_has_avx2();
+#else
+    int info[4];
+    __cpuid(info, 0);
+    if (info[0] < 7) {
+        return false;
+    }
+    __cpuidex(info, 1, 0);
+    if ((info[2] & (1 << 27)) == 0 || (_xgetbv(0) & 0xE6) != 0xE6) {
+        return false;
+    }
+    __cpuidex(info, 7, 0);
+    const int need_b = (1 << 16) | (1 << 30) | (1 << 31);   // F, BW, VL
+    return (info[1] & need_b) == need_b && (info[2] & (1 << 11)) != 0 && (info[2] & (1 << 1)) != 0 && cpu_has_avx2();   // VNNI, VBMI
+#endif
+}
+
+// q8_0 activation row followed, per 64 weights, by 16 floats (the scale of each 32-block repeated 8 times) and
+// 16 int32 (the sum of every group of 4 activations, one per dpbusd lane): computed once per activation, they
+// spare the q2_0 dot its scale conversions and the -1 offset sum, which it would otherwise redo for every row
+static ggml_from_float_t g_q8_0_from_float = nullptr;
+
+static void quantize_q8_0_with_sums(const float * x, void * y, int64_t k) {
+    g_q8_0_from_float(x, y, k);
+    const int nb64 = (int) (k / 64);
+    uint8_t * base = static_cast<uint8_t *>(y);
+    uint8_t * tail = base + size_t(k / 32) * 34;
+    for (int i = 0; i < nb64; ++i) {
+        float   scale[16];
+        int32_t sum[16];
+        for (int h = 0; h < 2; ++h) {
+            const uint8_t * blk = base + size_t(2 * i + h) * 34;
+            uint16_t d16;
+            memcpy(&d16, blk, 2);
+            const int8_t * q = reinterpret_cast<const int8_t *>(blk + 2);
+            for (int j = 0; j < 8; ++j) {
+                scale[8 * h + j] = ggml_fp16_to_fp32(d16);
+                sum[8 * h + j]   = q[4 * j] + q[4 * j + 1] + q[4 * j + 2] + q[4 * j + 3];   // what dpbusd(ones, q) gives
+            }
+        }
+        memcpy(tail + size_t(i) * 128, scale, 64);
+        memcpy(tail + size_t(i) * 128 + 64, sum, 64);
+    }
+}
+
+// q2_0 x q8_0 with the VNNI/VBMI instructions on 256-bit vectors (512-bit ones were slower here: the core drops
+// its clock, which also slows the next layer). The activation row comes from quantize_q8_0_with_sums.
+HPCACHE_VBMI static void dot_q2_0_q8_0_ymm(int n, float * s, size_t, const void * vx, size_t, const void * vy, size_t, int) {
+    struct blk2 { uint16_t d; uint8_t qs[16]; };
+    const blk2 *    x    = static_cast<const blk2 *>(vx);
+    const uint8_t * y    = static_cast<const uint8_t *>(vy);
+    const uint8_t * tail = y + size_t(n / 32) * 34;
+    const int nb = n / 64;
+
+    const __m256i ctrl = _mm256_set1_epi64x((long long) 0x0E0C0A0806040200ULL);
+    const __m256i c3   = _mm256_set1_epi8(3);
+    __m256 acc = _mm256_setzero_ps();
+    for (int i = 0; i < nb; ++i) {
+        const uint8_t * ya = y + size_t(2 * i) * 34 + 2;
+        const uint8_t * yb = ya + 34;
+        const uint8_t * t  = tail + size_t(i) * 128;
+
+        const __m128i bits = _mm_loadu_si128(reinterpret_cast<const __m128i *>(x[i].qs));
+        const __m256i w0 = _mm256_and_si256(_mm256_multishift_epi64_epi8(ctrl, _mm256_cvtepu16_epi64(bits)), c3);
+        const __m256i w1 = _mm256_and_si256(_mm256_multishift_epi64_epi8(ctrl, _mm256_cvtepu16_epi64(_mm_srli_si128(bits, 8))), c3);
+        __m256i d0v = _mm256_dpbusd_epi32(_mm256_setzero_si256(), w0, _mm256_loadu_si256(reinterpret_cast<const __m256i *>(ya)));
+        __m256i d1v = _mm256_dpbusd_epi32(_mm256_setzero_si256(), w1, _mm256_loadu_si256(reinterpret_cast<const __m256i *>(yb)));
+        d0v = _mm256_sub_epi32(d0v, _mm256_loadu_si256(reinterpret_cast<const __m256i *>(t + 64)));
+        d1v = _mm256_sub_epi32(d1v, _mm256_loadu_si256(reinterpret_cast<const __m256i *>(t + 96)));
+
+        uint16_t h;
+        memcpy(&h, &x[i].d, 2);
+        const __m256 dd = _mm256_set1_ps(_mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(h))));
+        acc = _mm256_fmadd_ps(_mm256_mul_ps(dd, _mm256_loadu_ps(reinterpret_cast<const float *>(t))), _mm256_cvtepi32_ps(d0v), acc);
+        acc = _mm256_fmadd_ps(_mm256_mul_ps(dd, _mm256_loadu_ps(reinterpret_cast<const float *>(t + 32))), _mm256_cvtepi32_ps(d1v), acc);
+    }
+    const __m128 r0 = _mm_add_ps(_mm256_castps256_ps128(acc), _mm256_extractf128_ps(acc, 1));
+    const __m128 r1 = _mm_add_ps(r0, _mm_movehl_ps(r0, r0));
+    *s = _mm_cvtss_f32(_mm_add_ss(r1, _mm_shuffle_ps(r1, r1, 1)));
+}
 #endif
 
 bool hpcache_cpu_pool::describe(hpcache_expert_desc & d, ggml_type gate, ggml_type up, ggml_type down,
@@ -232,13 +331,19 @@ bool hpcache_cpu_pool::describe(hpcache_expert_desc & d, ggml_type gate, ggml_ty
             return false;
         }
         *e.dot   = t->vec_dot;
+        *e.quant = q->from_float;
+        *e.xq_bytes = ggml_row_size(t->vec_dot_type, e.n);
 #if defined(__x86_64__) || defined(_M_X64)
         if (e.type == GGML_TYPE_Q2_0 && cpu_has_avx2()) {
             *e.dot = (cpu_has_vnni() && !getenv("HPCACHE_NO_VNNI")) ? dot_q2_0_q8_0_vnni : dot_q2_0_q8_0_avx2;
+            if (e.n % 64 == 0 && t->vec_dot_type == GGML_TYPE_Q8_0 && cpu_has_vbmi_vnni() && !getenv("HPCACHE_NO_VBMI")) {
+                g_q8_0_from_float = q->from_float;
+                *e.dot   = dot_q2_0_q8_0_ymm;
+                *e.quant = quantize_q8_0_with_sums;
+                *e.xq_bytes += size_t(e.n / 64) * 128;
+            }
         }
 #endif
-        *e.quant = q->from_float;
-        *e.xq_bytes = ggml_row_size(t->vec_dot_type, e.n);
     }
     return true;
 }
@@ -313,6 +418,11 @@ void hpcache_cpu_pool::execute(task & t, int ith) {
     const int64_t n_ff  = d.n_ff;
     const int64_t n_out = d.n_embd;
     const int64_t t0 = ith == 0 ? now_ns() : 0;
+    int64_t c0 = 0;
+    if (g_tm) {
+        c0 = now_ns();
+        g_ph[0] += c0 - t.t_start;
+    }
 
     // gate and up rows of every routed expert, with the activation applied
     const int blocks_b = (int) ((n_ff + RB_GATE - 1) / RB_GATE);
@@ -344,15 +454,33 @@ void hpcache_cpu_pool::execute(task & t, int ith) {
         }
     }
     const int64_t t1 = ith == 0 ? now_ns() : 0;
+    int64_t c1 = 0, c2 = 0;
+    if (g_tm) {
+        c1 = now_ns();
+        g_ph[1] += c1 - c0;
+    }
     barrier();
     const int64_t t1b = ith == 0 ? now_ns() : 0;
+    if (g_tm) {
+        c2 = now_ns();
+        g_ph[2] += c2 - c1;
+    }
 
     // the activations in the vec_dot type of the down tensor
     for (int i = ith; i < m; i += n_threads) {
         d.down_quant(t.act + int64_t(i) * n_ff, t.actq + size_t(i) * d.down_xq_bytes, n_ff);
     }
+    int64_t c3 = 0, c4 = 0;
+    if (g_tm) {
+        c3 = now_ns();
+        g_ph[3] += c3 - c2;
+    }
     barrier();
     const int64_t t2 = ith == 0 ? now_ns() : 0;
+    if (g_tm) {
+        c4 = now_ns();
+        g_ph[4] += c4 - c3;
+    }
 
     // down rows per expert, weighted by the router
     const int blocks_d = (int) ((n_out + RB_DOWN - 1) / RB_DOWN);
@@ -377,7 +505,16 @@ void hpcache_cpu_pool::execute(task & t, int ith) {
             part[row] = wi * v;
         }
     }
+    int64_t c5 = 0, c6 = 0;
+    if (g_tm) {
+        c5 = now_ns();
+        g_ph[5] += c5 - c4;
+    }
     barrier();
+    if (g_tm) {
+        c6 = now_ns();
+        g_ph[6] += c6 - c5;
+    }
 
     // sum over the experts
     for (int64_t r = ith * 64; r < n_out; r += int64_t(n_threads) * 64) {
@@ -389,6 +526,9 @@ void hpcache_cpu_pool::execute(task & t, int ith) {
             }
             t.y[row] = acc;
         }
+    }
+    if (g_tm) {
+        g_ph[7] += now_ns() - c6;
     }
 
     if (ith == 0) {
@@ -441,6 +581,7 @@ void hpcache_cpu_pool::run(const hpcache_expert_desc & d, const float * x, const
 
     done.store(0, std::memory_order_relaxed);
     bar_count.store(0, std::memory_order_relaxed);
+    t.t_start = g_tm ? now_ns() : 0;
     current.store(&t, std::memory_order_release);
     job_gen.fetch_add(1, std::memory_order_acq_rel);
 
