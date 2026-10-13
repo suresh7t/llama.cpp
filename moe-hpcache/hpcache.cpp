@@ -127,6 +127,14 @@ common_moe_hpcache_plan common_moe_hpcache_parse_plan(const common_json & plan) 
     result.ple_weight_bytes = plan.value("ple_table_weight_bytes", uint64_t(0));
     result.expert_weight_bytes = plan["expert_weight_bytes"].get<uint64_t>();
     result.ple_resident_fraction = plan.value("ple_resident_fraction", 0.30);
+    if (plan.contains("expert_split") && plan["expert_split"].is_object()) {
+        const auto & split = plan["expert_split"];
+        result.expert_split.present = true;
+        result.expert_split.cpu_gb_per_s = split.value("cpu_gb_per_s", 0.0);
+        result.expert_split.pcie_gb_per_s = split.value("pcie_gb_per_s", 0.0);
+        result.expert_split.pcie_frac = split.value("pcie_frac", 0.0);
+        result.expert_split.pcie_max = split.value("pcie_max", 0);
+    }
 
     require_plan_field("schema_version", result.schema_version == 1);
     require_plan_field("context_tokens", result.context_tokens > 0);
