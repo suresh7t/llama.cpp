@@ -1,3 +1,16 @@
+#if defined(_WIN32)
+#define NOMINMAX
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#else
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
+
+#ifdef HPCACHE_CUDA
+#include <cuda_runtime.h>
+#endif
+
 #include "fit.h"
 #include "ggml-backend.h"
 #include "ggml-cpp.h"
@@ -7,6 +20,7 @@
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -717,6 +731,216 @@ static double improve_plan(std::vector<device_result> & devices) {
     return best_time;
 }
 
+
+// What the host can page-lock for the expert arena. The probe commits one region, registers it with the backend in
+// slices (the backend's register_host_buffer entry point, CUDA cudaHostRegister), times host to device copies out of
+// it, and releases everything. Registering to the point of failure would leave the machine without memory, so the
+// probe stops `headroom` below the available RAM and reports that as the proven limit.
+struct host_arena_result {
+    bool        measured = false;
+    std::string device;
+    std::string error;
+    size_t      slice_bytes       = 0;
+    size_t      available_ram     = 0;
+    size_t      headroom          = 0;
+    size_t      probed_bytes      = 0;   // what the probe tried to register
+    size_t      registered_bytes  = 0;   // what the backend accepted
+    size_t      recommended_bytes = 0;   // min(experts, registered)
+    double      h2d_gbps          = 0.0;
+};
+
+static size_t available_ram_bytes() {
+#if defined(_WIN32)
+    MEMORYSTATUSEX ms = {};
+    ms.dwLength = sizeof(ms);
+    return GlobalMemoryStatusEx(&ms) ? size_t(ms.ullAvailPhys) : 0;
+#else
+    const long pages = sysconf(_SC_AVPHYS_PAGES), size = sysconf(_SC_PAGE_SIZE);
+    return pages > 0 && size > 0 ? size_t(pages) * size_t(size) : 0;
+#endif
+}
+
+static void * region_alloc(size_t bytes) {
+#if defined(_WIN32)
+    return VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    void * p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    return p == MAP_FAILED ? nullptr : p;
+#endif
+}
+
+static void region_free(void * p, size_t bytes) {
+#if defined(_WIN32)
+    (void) bytes;
+    VirtualFree(p, 0, MEM_RELEASE);
+#else
+    munmap(p, bytes);
+#endif
+}
+
+#ifdef HPCACHE_CUDA
+// The probe runs before any backend queries device memory: a CUDA context on a second GPU (a display card on a narrow
+// link) makes registrations of this size fail, and the compute process does not create one for the arena either.
+static host_arena_result probe_host_arena(size_t expert_bytes, size_t headroom) {
+    host_arena_result result;
+    result.slice_bytes = size_t(256) << 20;
+    result.headroom    = headroom;
+
+    int n_devices = 0;
+    if (cudaGetDeviceCount(&n_devices) != cudaSuccess || n_devices < 1) {
+        cudaGetLastError();
+        result.error = "no CUDA device";
+        return result;
+    }
+    int best = 0;
+    size_t best_mem = 0;
+    for (int i = 0; i < n_devices; ++i) {   // property queries do not create a context
+        cudaDeviceProp prop;
+        if (cudaGetDeviceProperties(&prop, i) == cudaSuccess && prop.totalGlobalMem > best_mem) {
+            best_mem = prop.totalGlobalMem;
+            best     = i;
+        }
+    }
+    cudaDeviceProp prop;
+    cudaGetDeviceProperties(&prop, best);
+    result.device = prop.name;
+
+    result.available_ram = available_ram_bytes();
+    if (result.available_ram <= headroom + result.slice_bytes) {
+        result.error = "not enough available RAM above the headroom";
+        return result;
+    }
+    size_t want = std::min(expert_bytes, result.available_ram - headroom);
+    want = (want + result.slice_bytes - 1) / result.slice_bytes * result.slice_bytes;
+    if (want > result.available_ram - headroom) {
+        want -= result.slice_bytes;
+    }
+    result.probed_bytes = want;
+
+    uint8_t * base = static_cast<uint8_t *>(region_alloc(want));
+    if (!base) {
+        result.error = "could not allocate the probe region";
+        return result;
+    }
+    {   // the pages must exist, as they will once the arena is filled from the file
+        const int n_threads = int(std::max(1u, std::min(8u, std::thread::hardware_concurrency())));
+        std::vector<std::thread> workers;
+        for (int t = 0; t < n_threads; ++t) {
+            workers.emplace_back([&, t] {
+                for (size_t off = size_t(t) * result.slice_bytes; off < want; off += size_t(n_threads) * result.slice_bytes) {
+                    memset(base + off, 0x5a, std::min(result.slice_bytes, want - off));
+                }
+            });
+        }
+        for (auto & w : workers) {
+            w.join();
+        }
+    }
+
+    cudaSetDevice(best);
+    size_t registered = 0;
+    unsigned flags = cudaHostRegisterMapped | cudaHostRegisterReadOnly;
+    while (registered < want) {
+        const size_t len = std::min(result.slice_bytes, want - registered);
+        cudaError_t e = cudaHostRegister(base + registered, len, flags);
+        if (e != cudaSuccess && registered == 0 && (flags & cudaHostRegisterReadOnly)) {
+            cudaGetLastError();
+            flags = cudaHostRegisterMapped;   // read-only registration is not supported here
+            e = cudaHostRegister(base + registered, len, flags);
+        }
+        if (e != cudaSuccess) {
+            cudaGetLastError();
+            break;
+        }
+        registered += len;
+    }
+
+    // copy rate out of the registered region: 4 MiB pieces spread over it, every call checked
+    bool usable = registered >= result.slice_bytes;
+    if (usable) {
+        const size_t piece = size_t(4) << 20;
+        void *       dev_buf = nullptr;
+        cudaStream_t stream  = nullptr;
+        usable = cudaMalloc(&dev_buf, piece) == cudaSuccess && cudaStreamCreate(&stream) == cudaSuccess;
+        const size_t n_slices = registered / result.slice_bytes;
+        const int    n_pieces = 64;
+        auto copy = [&](int i) {
+            const size_t slice  = size_t(i) % n_slices;
+            const size_t inside = (size_t(i) / n_slices * piece) % (result.slice_bytes - piece);
+            return cudaMemcpyAsync(dev_buf, base + slice * result.slice_bytes + inside, piece, cudaMemcpyHostToDevice, stream) == cudaSuccess;
+        };
+        usable = usable && copy(0) && cudaStreamSynchronize(stream) == cudaSuccess;
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; usable && i < n_pieces; ++i) {
+            usable = copy(i);
+        }
+        usable = usable && cudaStreamSynchronize(stream) == cudaSuccess;
+        const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        if (usable) {
+            result.h2d_gbps = double(piece) * n_pieces / 1e9 / sec;
+        }
+        if (stream) {
+            cudaStreamDestroy(stream);
+        }
+        cudaFree(dev_buf);
+    }
+    for (size_t off = 0; off < registered; off += result.slice_bytes) {
+        cudaHostUnregister(base + off);
+    }
+    cudaGetLastError();
+    region_free(base, want);
+
+    result.registered_bytes = usable ? registered : 0;
+    if (!usable) {
+        result.error = "registered memory could not be copied from at this size";
+    }
+    result.recommended_bytes = std::min(result.registered_bytes, expert_bytes);
+    result.measured = true;
+    return result;
+}
+#else
+static host_arena_result probe_host_arena(size_t, size_t headroom) {
+    host_arena_result result;
+    result.headroom = headroom;
+    result.error    = "built without CUDA";
+    return result;
+}
+#endif
+
+// The split of the missed experts between the CPU and the GPU's PCIe path: each gets a share proportional to its rate.
+struct expert_split_result {
+    bool   valid = false;
+    double cpu_gb_per_s = 0.0;
+    double pcie_gb_per_s = 0.0;
+    double pcie_frac = 0.0;
+    int    pcie_max = 0;
+};
+
+static expert_split_result derive_split(const std::vector<device_result> & devices, const expert_sample & sample,
+        const host_arena_result & arena) {
+    expert_split_result r;
+    if (!arena.measured || arena.h2d_gbps <= 0.0) {
+        return r;
+    }
+    for (const auto & device : devices) {
+        if (ggml_backend_dev_type(device.dev) == GGML_BACKEND_DEVICE_TYPE_CPU && device.error.empty() && device.ms_per_expert > 0.0) {
+            // one expert matrix of the sample tensor per timed operation
+            const double bytes = double(ggml_row_size(sample.type, sample.ne0)) * double(sample.ne1);
+            r.cpu_gb_per_s = bytes / (device.ms_per_expert * 1e6);
+            break;
+        }
+    }
+    if (r.cpu_gb_per_s <= 0.0) {
+        return r;
+    }
+    r.pcie_gb_per_s = arena.h2d_gbps;
+    r.pcie_frac = std::min(0.8, std::max(0.1, r.pcie_gb_per_s / (r.pcie_gb_per_s + r.cpu_gb_per_s)));
+    // about half of the routed experts miss the pool: the most the GPU path has to hold
+    r.pcie_max = std::min(6, std::max(2, int(std::ceil(double(sample.n_used) * 0.55 * r.pcie_frac))));
+    r.valid = true;
+    return r;
+}
+
 static bool write_json(const char *                       path,
                        const char *                       model,
                        const expert_sample &              sample,
@@ -724,7 +948,9 @@ static bool write_json(const char *                       path,
                        ggml_type                          type_k,
                        ggml_type                          type_v,
                        double                             parallel_ms,
-                       size_t                             expert_shortfall) {
+                       size_t                             expert_shortfall,
+                       const host_arena_result &          arena,
+                       const expert_split_result &        split) {
     std::ofstream out(path);
     if (!out) {
         return false;
@@ -781,6 +1007,22 @@ static bool write_json(const char *                       path,
     out << "  \"active_experts_per_layer\": " << sample.n_used << ",\n";
     out << "  \"bytes_per_expert_group\": " << sample.group_bytes << ",\n";
     out << "  \"expert_cache_capacity_assumption\": \"all dense weights on each device, PLE offloaded\",\n";
+    out << "  \"host_arena\": {\"measured\": " << (arena.measured ? "true" : "false") << ", "
+        << "\"device\": \"" << json_escape(arena.device) << "\", "
+        << "\"slice_bytes\": " << arena.slice_bytes << ", "
+        << "\"available_ram_bytes\": " << arena.available_ram << ", "
+        << "\"headroom_bytes\": " << arena.headroom << ", "
+        << "\"probed_bytes\": " << arena.probed_bytes << ", "
+        << "\"registered_bytes\": " << arena.registered_bytes << ", "
+        << "\"recommended_bytes\": " << arena.recommended_bytes << ", "
+        << "\"h2d_gb_per_s\": " << arena.h2d_gbps << ", "
+        << "\"error\": \"" << json_escape(arena.error) << "\"},\n";
+    if (split.valid) {
+        out << "  \"expert_split\": {\"cpu_gb_per_s\": " << split.cpu_gb_per_s << ", "
+            << "\"pcie_gb_per_s\": " << split.pcie_gb_per_s << ", "
+            << "\"pcie_frac\": " << split.pcie_frac << ", "
+            << "\"pcie_max\": " << split.pcie_max << "},\n";
+    }
     out << "  \"parallel_sample_ms\": " << parallel_ms << ",\n  \"devices\": [\n";
     for (size_t i = 0; i < devices.size(); ++i) {
         const auto &           device = devices[i];
@@ -829,7 +1071,9 @@ int main(int argc, char ** argv) {
     ggml_type    type_k = GGML_TYPE_F16;
     ggml_type    type_v = GGML_TYPE_F16;
     double       kv_fraction = 1.0;
-    static const char * usage = "usage: %s -m model.gguf [-o hpcache-calibration.json] [-ctx tokens|128kib] [-ctk f16|q5_0] [-ctv f16|q5_0] [-kvf 0.0-1.0]\n";
+    double       arena_headroom_gib = 12.0;
+    bool         probe_arena = true;
+    static const char * usage = "usage: %s -m model.gguf [-o hpcache-calibration.json] [-ctx tokens|128kib] [-ctk f16|q5_0] [-ctv f16|q5_0] [-kvf 0.0-1.0] [-arena-headroom-gib N] [-no-arena]\n";
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) {
             model = argv[++i];
@@ -840,6 +1084,10 @@ int main(int argc, char ** argv) {
                 fprintf(stderr, "calibration: -kvf must be in (0, 1]\n");
                 return 1;
             }
+        } else if (strcmp(argv[i], "-arena-headroom-gib") == 0 && i + 1 < argc) {
+            arena_headroom_gib = atof(argv[++i]);
+        } else if (strcmp(argv[i], "-no-arena") == 0) {
+            probe_arena = false;
         } else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
             output = argv[++i];
         } else if (strcmp(argv[i], "-ctx") == 0 && i + 1 < argc) {
@@ -887,6 +1135,10 @@ int main(int argc, char ** argv) {
     if (context_explicit) {
         sample.context_tokens = context_tokens;
     }
+    host_arena_result arena;
+    if (probe_arena) {
+        arena = probe_host_arena(sample.expert_bytes, size_t(arena_headroom_gib * double(1ull << 30)));
+    }
 #ifdef GGML_BACKEND_DL
     ggml_backend_load_all();
 #endif
@@ -928,7 +1180,8 @@ int main(int argc, char ** argv) {
         }
     }
     const size_t expert_shortfall = sample.expert_bytes > expert_capacity ? sample.expert_bytes - expert_capacity : 0;
-    if (parallel_ms < 0 || !write_json(output, model, sample, devices, type_k, type_v, parallel_ms, expert_shortfall)) {
+    const expert_split_result split = derive_split(devices, sample, arena);
+    if (parallel_ms < 0 || !write_json(output, model, sample, devices, type_k, type_v, parallel_ms, expert_shortfall, arena, split)) {
         fprintf(stderr, "calibration: could not complete or write calibration\n");
         return 1;
     }
@@ -952,6 +1205,19 @@ int main(int argc, char ** argv) {
                    double(cache_bytes) / (1ull << 30), mean_bytes ? cache_bytes / mean_bytes : 0,
                    p99_bytes ? cache_bytes / p99_bytes : 0);
         }
+    }
+    if (split.valid) {
+        printf("calibration: expert split: CPU %.1f GB/s, PCIe %.1f GB/s -> GPU share %.2f, up to %d experts per layer\n",
+               split.cpu_gb_per_s, split.pcie_gb_per_s, split.pcie_frac, split.pcie_max);
+    }
+    if (arena.measured) {
+        printf("calibration: host arena: %.2f GiB registered of %.2f GiB probed (RAM available %.2f GiB, headroom %.2f GiB), "
+               "recommended %.2f GiB, copy %.1f GB/s\n",
+               double(arena.registered_bytes) / (1ull << 30), double(arena.probed_bytes) / (1ull << 30),
+               double(arena.available_ram) / (1ull << 30), double(arena.headroom) / (1ull << 30),
+               double(arena.recommended_bytes) / (1ull << 30), arena.h2d_gbps);
+    } else if (probe_arena) {
+        printf("calibration: host arena not measured: %s\n", arena.error.c_str());
     }
     printf("calibration: wrote %s\n", output);
     if (expert_shortfall > 0) {
