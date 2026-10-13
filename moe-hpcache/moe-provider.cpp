@@ -243,6 +243,10 @@ extern "C" MOE_HPCACHE_EXPORT const llama_moe_provider_api * llama_moe_provider_
         }
         if (!param("reserve_mib").empty()) {
             pool.reserve_bytes = size_t(atoll(param("reserve_mib").c_str())) << 20;
+        } else if (!param("n_ubatch").empty() && atoll(param("n_ubatch").c_str()) > 0) {
+            // the compute buffers are sized by the micro-batch: measured 1061 MiB at 512 and under 550 MiB at 128
+            const int64_t ub = atoll(param("n_ubatch").c_str());
+            pool.reserve_bytes = size_t(450 + ub * 8 / 5) << 20;
         }
         if (param("kernel") == "ggml") {
             pool.cpu_kernel = false;
@@ -252,6 +256,46 @@ extern "C" MOE_HPCACHE_EXPORT const llama_moe_provider_api * llama_moe_provider_
         }
         if (!param("swap_every").empty()) {
             pool.swap_every = atoi(param("swap_every").c_str());
+        }
+        if (!param("async_swaps").empty()) {
+            pool.async_swaps = atoi(param("async_swaps").c_str()) != 0;
+        }
+        if (!param("arena").empty()) {
+            pool.arena = atoi(param("arena").c_str()) != 0;
+        }
+        if (provider->plan.expert_split.present) {
+            const auto & split = provider->plan.expert_split;
+            if (split.pcie_frac > 0.0) {
+                pool.pcie_frac = float(split.pcie_frac);
+            }
+            if (split.pcie_max > 0) {
+                pool.pcie_max = split.pcie_max;
+            }
+            provider->log(GGML_LOG_LEVEL_INFO, "expert split from the calibration: CPU " +
+                    std::to_string(split.cpu_gb_per_s).substr(0, 5) + " GB/s, PCIe " +
+                    std::to_string(split.pcie_gb_per_s).substr(0, 5) + " GB/s, GPU share " +
+                    std::to_string(split.pcie_frac).substr(0, 4) + ", up to " + std::to_string(split.pcie_max) + " experts");
+        }
+        if (!param("pcie_adapt").empty()) {
+            pool.pcie_adapt = atoi(param("pcie_adapt").c_str()) != 0;
+        }
+        if (!param("pcie").empty()) {
+            pool.pcie = atoi(param("pcie").c_str()) != 0;
+        }
+        if (!param("pcie_max").empty()) {
+            pool.pcie_max = atoi(param("pcie_max").c_str());
+        }
+        if (!param("pcie_frac").empty()) {
+            pool.pcie_frac = float(atof(param("pcie_frac").c_str()));
+        }
+        if (!param("pin_mib").empty()) {
+            pool.pin_bytes = size_t(atoll(param("pin_mib").c_str())) << 20;
+        }
+        if (!param("arena_mib").empty()) {
+            pool.arena_bytes = size_t(atoll(param("arena_mib").c_str())) << 20;
+        }
+        if (!param("spare_slot").empty()) {
+            pool.spare_slot = atoi(param("spare_slot").c_str()) != 0;
         }
         if (!param("max_swaps").empty()) {
             pool.max_swaps = atoi(param("max_swaps").c_str());
