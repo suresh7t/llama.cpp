@@ -17,6 +17,8 @@ struct hpcache_doorbell {
     volatile int32_t *  layer = nullptr;   // layer of the last publish
     volatile uint32_t * seq   = nullptr;   // bumped by the GPU after each publish
     volatile uint32_t * flag  = nullptr;   // set by the host to the seq it served
+    volatile int32_t *  frac  = nullptr;   // GPU share of the missed experts, 0..256, written by the host between steps
+    volatile unsigned long long * wait_ns = nullptr;   // total time the GPU waited for the follower, written by the GPU
 
     // the same memory, as the device sees it
     float *             d_x     = nullptr;
@@ -26,6 +28,8 @@ struct hpcache_doorbell {
     volatile int32_t *  d_layer = nullptr;
     volatile uint32_t * d_seq   = nullptr;
     volatile uint32_t * d_flag  = nullptr;
+    volatile int32_t *  d_frac  = nullptr;
+    volatile unsigned long long * d_wait_ns = nullptr;
 
     void * block = nullptr;
 };
@@ -44,6 +48,7 @@ void hpcache_cuda_wait_merge(void * stream, const hpcache_doorbell & db, float *
 void hpcache_cuda_flush(void * stream);
 int  hpcache_cuda_get_device();
 void hpcache_cuda_set_device(int device);
+
 void hpcache_cuda_sync_device();
 
 // slot table of one layer: expert id -> pool slot or -1, in device memory
@@ -62,3 +67,26 @@ void hpcache_cuda_remap_weights(void * stream, const int32_t * ids, const float 
 
 // CUDA device index of a PCI bus id such as "0000:01:00.0", -1 when unknown
 int hpcache_cuda_device_by_pci(const char * pci_bus_id);
+
+// The GPU's share of the missed experts of one token: of the routed experts that are not in the pool, in routing
+// order, the last g, g = min(m, (misses * frac256) >> 8). out_ids / out_w hold m entries, the unused ones repeat an
+// expert with weight 0. Either output may be NULL. table may be NULL (no pool: every expert is a miss).
+void hpcache_cuda_pcie_select(void * stream, const int32_t * ids, const float * w, const int32_t * table,
+        int k, int n_expert, int m, const volatile int32_t * frac256, int32_t * out_ids, float * out_w);
+
+// Experts that the GPU fetches itself: the stage kernel copies the experts selected by the rule above from the
+// page-locked arena (read through PCIe) into device staging slots, one slot per selected expert.
+struct hpcache_stage_args {
+    int          n_tensors = 0;      // 3 (gate, up, down) or fewer
+    const void * src[4]    = {};     // arena device address of expert 0 of each tensor
+    size_t       bytes[4]  = {};     // bytes of one expert, also the distance between experts
+    void *       dst[4]    = {};     // staging slot 0 of each tensor
+};
+void hpcache_cuda_pcie_stage(void * stream, const int32_t * ids, const int32_t * table, int k, int n_expert, int m,
+        const volatile int32_t * frac256, const hpcache_stage_args & args);
+
+// the device address of a registered host pointer, NULL when it is not registered for mapping
+void * hpcache_cuda_host_device_ptr(const void * ptr);
+
+// page-lock (pin = true) or release a host range for the current device, false on refusal
+bool hpcache_cuda_host_register(void * ptr, size_t nbytes, bool pin);

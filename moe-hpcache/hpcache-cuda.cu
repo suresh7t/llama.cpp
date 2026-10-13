@@ -43,6 +43,8 @@ bool hpcache_doorbell_init(hpcache_doorbell & db, int n_embd, int k, std::string
     db.seq   = reinterpret_cast<volatile uint32_t *>(h + 0);
     db.flag  = reinterpret_cast<volatile uint32_t *>(h + 64);
     db.layer = reinterpret_cast<volatile int32_t  *>(h + 128);
+    db.frac  = reinterpret_cast<volatile int32_t  *>(h + 192);
+    db.wait_ns = reinterpret_cast<volatile unsigned long long *>(h + 200);
     db.x     = reinterpret_cast<float   *>(h + off_x);
     db.ids   = reinterpret_cast<int32_t *>(h + off_ids);
     db.w     = reinterpret_cast<float   *>(h + off_w);
@@ -51,6 +53,8 @@ bool hpcache_doorbell_init(hpcache_doorbell & db, int n_embd, int k, std::string
     db.d_seq   = reinterpret_cast<volatile uint32_t *>(d + 0);
     db.d_flag  = reinterpret_cast<volatile uint32_t *>(d + 64);
     db.d_layer = reinterpret_cast<volatile int32_t  *>(d + 128);
+    db.d_frac  = reinterpret_cast<volatile int32_t  *>(d + 192);
+    db.d_wait_ns = reinterpret_cast<volatile unsigned long long *>(d + 200);
     db.d_x     = reinterpret_cast<float   *>(d + off_x);
     db.d_ids   = reinterpret_cast<int32_t *>(d + off_ids);
     db.d_w     = reinterpret_cast<float   *>(d + off_w);
@@ -85,17 +89,26 @@ static __global__ void publish_kernel(const float * x, const int32_t * ids, cons
     }
 }
 
+static __device__ __forceinline__ unsigned long long global_ns() {
+    unsigned long long t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    return t;
+}
+
 static __global__ void wait_merge_kernel(const volatile uint32_t * flag, const volatile uint32_t * seq,
-        const volatile float * y, float * dst, int n) {
+        const volatile float * y, float * dst, int n, volatile unsigned long long * wait_ns) {
     __shared__ uint32_t want;
     if (threadIdx.x == 0) {
         want = *seq;
+        const unsigned long long t0 = global_ns();
         while (*flag != want) {
 #if __CUDA_ARCH__ >= 700
             __nanosleep(100);
 #endif
         }
         __threadfence_system();
+        // one wait kernel runs at a time, so a plain add is enough
+        *wait_ns = *wait_ns + (global_ns() - t0);
     }
     __syncthreads();
     for (int i = threadIdx.x; i < n; i += blockDim.x) {
@@ -114,7 +127,7 @@ void hpcache_cuda_publish(void * stream, const hpcache_doorbell & db,
 }
 
 void hpcache_cuda_wait_merge(void * stream, const hpcache_doorbell & db, float * dst) {
-    wait_merge_kernel<<<1, 256, 0, (cudaStream_t) stream>>>(db.d_flag, db.d_seq, db.d_y, dst, db.n_embd);
+    wait_merge_kernel<<<1, 256, 0, (cudaStream_t) stream>>>(db.d_flag, db.d_seq, db.d_y, dst, db.n_embd, db.d_wait_ns);
     const cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "moe-hpcache: wait kernel launch failed: %s\n", cudaGetErrorString(err));
@@ -215,4 +228,134 @@ int hpcache_cuda_device_by_pci(const char * pci_bus_id) {
         return -1;
     }
     return device;
+}
+
+// page-lock a host range (or release it); not portable, so it is mapped for the current device only
+bool hpcache_cuda_host_register(void * ptr, size_t nbytes, bool pin) {
+    if (!pin) {
+        const cudaError_t e = cudaHostUnregister(ptr);
+        if (e != cudaSuccess) {
+            cudaGetLastError();
+        }
+        return e == cudaSuccess;
+    }
+    const cudaError_t e = cudaHostRegister(ptr, nbytes, cudaHostRegisterMapped);
+    if (e != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    return true;
+}
+
+static __global__ void pcie_select_kernel(const int32_t * ids, const float * w, const int32_t * table, int k, int n_expert,
+        int m, const volatile int32_t * frac_ptr, int32_t * out_ids, float * out_w) {
+    if (threadIdx.x != 0) {
+        return;
+    }
+    const int frac256 = *frac_ptr;
+    int miss[32];
+    int n = 0;
+    for (int i = 0; i < k && i < 32; ++i) {
+        const int32_t e = ids[i];
+        if (e < 0 || e >= n_expert) {
+            continue;
+        }
+        if (table == nullptr || table[e] < 0) {
+            miss[n++] = i;
+        }
+    }
+    int g = (n * frac256) >> 8;
+    if (g > m) {
+        g = m;
+    }
+    const int pad_i = g > 0 ? miss[n - g] : 0;
+    const int32_t pad = k > 0 ? ids[pad_i] : 0;
+    for (int j = 0; j < m; ++j) {
+        if (j < g) {
+            const int i = miss[n - g + j];
+            if (out_ids != nullptr) {
+                out_ids[j] = j;
+            }
+            if (out_w != nullptr) {
+                out_w[j] = w[i];
+            }
+        } else {
+            if (out_ids != nullptr) {
+                out_ids[j] = j;
+            }
+            if (out_w != nullptr) {
+                out_w[j] = 0.0f;
+            }
+        }
+    }
+}
+
+void hpcache_cuda_pcie_select(void * stream, const int32_t * ids, const float * w, const int32_t * table,
+        int k, int n_expert, int m, const volatile int32_t * frac256, int32_t * out_ids, float * out_w) {
+    pcie_select_kernel<<<1, 32, 0, (cudaStream_t) stream>>>(ids, w, table, k, n_expert, m, frac256, out_ids, out_w);
+}
+
+void * hpcache_cuda_host_device_ptr(const void * ptr) {
+    void * dev = nullptr;
+    const cudaError_t e = cudaHostGetDevicePointer(&dev, const_cast<void *>(ptr), 0);
+    if (e != cudaSuccess) {
+        cudaGetLastError();
+        return nullptr;
+    }
+    return dev;
+}
+
+// one block per (selected expert, tensor, 16 KiB chunk); every block repeats the selection, which is 32 loop steps
+static __global__ void pcie_stage_kernel(const int32_t * ids, const int32_t * table, int k, int n_expert, int m,
+        const volatile int32_t * frac_ptr, hpcache_stage_args a) {
+    __shared__ int sel[32];
+    __shared__ int g;
+    if (threadIdx.x == 0) {
+        const int frac256 = *frac_ptr;
+        int miss[32];
+        int n = 0;
+        for (int i = 0; i < k && i < 32; ++i) {
+            const int32_t e = ids[i];
+            if (e < 0 || e >= n_expert) {
+                continue;
+            }
+            if (table == nullptr || table[e] < 0) {
+                miss[n++] = i;
+            }
+        }
+        int gg = (n * frac256) >> 8;
+        if (gg > m) {
+            gg = m;
+        }
+        g = gg;
+        for (int j = 0; j < gg; ++j) {
+            sel[j] = ids[miss[n - gg + j]];
+        }
+    }
+    __syncthreads();
+
+    const int j = blockIdx.x;
+    const int t = blockIdx.y;
+    if (t >= a.n_tensors) {
+        return;
+    }
+    const size_t n16 = a.bytes[t] / 16;
+    // an unused slot is zeroed: it holds the bytes of another layer's tensor type, which can decode to NaN
+    const bool fill = j < g;
+    const uint4 * src = fill ? reinterpret_cast<const uint4 *>(static_cast<const char *>(a.src[t]) + size_t(sel[j]) * a.bytes[t]) : nullptr;
+    uint4 * dst = reinterpret_cast<uint4 *>(static_cast<char *>(a.dst[t]) + size_t(j) * a.bytes[t]);
+    const size_t chunk = 1024;   // uint4 per block-z step: 16 KiB
+    for (size_t base = size_t(blockIdx.z) * chunk; base < n16; base += size_t(gridDim.z) * chunk) {
+        const size_t end = base + chunk < n16 ? base + chunk : n16;
+        for (size_t i = base + threadIdx.x; i < end; i += blockDim.x) {
+            dst[i] = fill ? src[i] : make_uint4(0, 0, 0, 0);
+        }
+    }
+}
+
+void hpcache_cuda_pcie_stage(void * stream, const int32_t * ids, const int32_t * table, int k, int n_expert, int m,
+        const volatile int32_t * frac256, const hpcache_stage_args & args) {
+    // enough blocks along z to keep many PCIe reads in flight
+    const dim3 grid(unsigned(m), unsigned(args.n_tensors), 32);
+    pcie_stage_kernel<<<grid, 256, 0, (cudaStream_t) stream>>>(ids, table, k, n_expert, m, frac256, args);
 }
