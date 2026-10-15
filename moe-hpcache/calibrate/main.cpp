@@ -51,6 +51,7 @@ struct expert_sample {
     size_t               token_bytes    = 0;
     bool                 token_on_cpu   = true;
     double               gpu_kv_fraction = 1.0;
+    double               memory_pool_fraction = 0.83;   // share of each device's total memory owned by the plan
     int64_t              expert_slots   = 0;
     std::vector<size_t>  dense_tensor_sizes;
     std::vector<size_t>  dense_layer_sizes;
@@ -538,8 +539,8 @@ static void prepare_device(device_result & result, const expert_sample & sample)
     result.memory_total = props.memory_total;
     result.device_id    = props.device_id ? props.device_id : "";
     result.features     = device_features(result.dev);
-    result.memory_pool   = result.memory_total / 5 * 4 + result.memory_total % 5 * 4 / 5;
-    // The calibration policy owns exactly 80% of total device memory.
+    result.memory_pool   = size_t(double(result.memory_total) * sample.memory_pool_fraction);
+    // The calibration policy owns a fixed share of total device memory (-pool-frac, default 83%).
     // Free-memory and compute estimates are reported for diagnostics only.
     result.memory_available_pool = result.memory_pool;
     const auto type = ggml_backend_dev_type(result.dev);
@@ -549,7 +550,7 @@ static void prepare_device(device_result & result, const expert_sample & sample)
     const size_t required = sample.dense_bytes > SIZE_MAX - result.kv_cache_bytes ? SIZE_MAX :
         sample.dense_bytes + result.kv_cache_bytes;
     if (result.weight_budget < required) {
-        result.error = "dense weights and KV cache do not fit the available 80% memory pool";
+        result.error = "dense weights and KV cache do not fit the owned memory pool";
         return;
     }
     result.expert_cache_budget = result.weight_budget - required;
@@ -973,7 +974,9 @@ static bool write_json(const char *                       path,
     out << "  \"cache_type_k\": \"" << ggml_type_name(type_k) << "\",\n";
     out << "  \"cache_type_v\": \"" << ggml_type_name(type_v) << "\",\n";
     out << "  \"working_memory_placement\": \"full_layers_per_backend_probe\",\n";
-    out << "  \"memory_pool_fraction\": 0.80,\n";
+    char pool_fraction[32];
+    snprintf(pool_fraction, sizeof(pool_fraction), "%.2f", sample.memory_pool_fraction);
+    out << "  \"memory_pool_fraction\": " << pool_fraction << ",\n";
     char kv_fraction[32];
     snprintf(kv_fraction, sizeof(kv_fraction), "%.2f", sample.gpu_kv_fraction);
     out << "  \"gpu_kv_cache_fraction\": " << kv_fraction << ",\n";
@@ -1071,17 +1074,41 @@ int main(int argc, char ** argv) {
     ggml_type    type_k = GGML_TYPE_F16;
     ggml_type    type_v = GGML_TYPE_F16;
     double       kv_fraction = 1.0;
+    double       pool_fraction = 0.83;
     double       arena_headroom_gib = 12.0;
     bool         probe_arena = true;
-    static const char * usage = "usage: %s -m model.gguf [-o hpcache-calibration.json] [-ctx tokens|128kib] [-ctk f16|q5_0] [-ctv f16|q5_0] [-kvf 0.0-1.0] [-arena-headroom-gib N] [-no-arena]\n";
+    std::vector<std::string> only_devices;
+    static const char * usage = "usage: %s -m model.gguf [-o hpcache-calibration.json] [-ctx tokens|128kib] [-ctk f16|q5_0] [-ctv f16|q5_0] [-kvf 0.0-1.0] [-pool-frac 0.5-0.95] [-dev name[,name]] [-arena-headroom-gib N] [-no-arena]\n";
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) {
             model = argv[++i];
+        } else if (strcmp(argv[i], "-dev") == 0 && i + 1 < argc) {
+            // only these GPUs are used; the CPU is always kept (the provider passes its --device selection)
+            const std::string list = argv[++i];
+            size_t start = 0;
+            while (start <= list.size()) {
+                const size_t end = list.find(',', start);
+                const std::string name = list.substr(start, end == std::string::npos ? std::string::npos : end - start);
+                if (!name.empty()) {
+                    only_devices.push_back(name);
+                }
+                if (end == std::string::npos) {
+                    break;
+                }
+                start = end + 1;
+            }
         } else if (strcmp(argv[i], "-kvf") == 0 && i + 1 < argc) {
             char * end = nullptr;
             kv_fraction = strtod(argv[++i], &end);
             if (end == argv[i] || *end != '\0' || !(kv_fraction > 0.0 && kv_fraction <= 1.0)) {
                 fprintf(stderr, "calibration: -kvf must be in (0, 1]\n");
+                return 1;
+            }
+        } else if (strcmp(argv[i], "-pool-frac") == 0 && i + 1 < argc) {
+            char * end = nullptr;
+            pool_fraction = strtod(argv[++i], &end);
+            if (end == argv[i] || *end != 0 || !(pool_fraction >= 0.5 && pool_fraction <= 0.95)) {
+                fprintf(stderr, "calibration: -pool-frac must be in [0.5, 0.95]\n");
                 return 1;
             }
         } else if (strcmp(argv[i], "-arena-headroom-gib") == 0 && i + 1 < argc) {
@@ -1132,6 +1159,7 @@ int main(int argc, char ** argv) {
         return 1;
     }
     sample.gpu_kv_fraction = kv_fraction;
+    sample.memory_pool_fraction = pool_fraction;
     if (context_explicit) {
         sample.context_tokens = context_tokens;
     }
@@ -1145,6 +1173,10 @@ int main(int argc, char ** argv) {
     std::vector<device_result> devices;
     for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (!only_devices.empty() && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU &&
+                std::find(only_devices.begin(), only_devices.end(), ggml_backend_dev_name(dev)) == only_devices.end()) {
+            continue;
+        }
         devices.emplace_back();
         devices.back().dev = dev;
     }
@@ -1199,8 +1231,8 @@ int main(int argc, char ** argv) {
             const size_t cache_bytes = device.expert_cache_budget;
             const size_t mean_bytes = sample.expert_bytes / size_t(sample.expert_slots);
             const size_t p99_bytes  = percentile(sample.expert_slot_sizes, 99);
-            printf("    80%% pool: %.2f GiB, dense %.2f GiB, GPU KV %.2f GiB, expert cache %.2f GiB; %zu mean-size or %zu P99-size slots\n",
-                   double(device.memory_pool) / (1ull << 30), double(sample.dense_bytes) / (1ull << 30),
+            printf("    %.0f%% pool: %.2f GiB, dense %.2f GiB, GPU KV %.2f GiB, expert cache %.2f GiB; %zu mean-size or %zu P99-size slots\n",
+                   sample.memory_pool_fraction * 100.0, double(device.memory_pool) / (1ull << 30), double(sample.dense_bytes) / (1ull << 30),
                    double(device.kv_cache_bytes) / (1ull << 30),
                    double(cache_bytes) / (1ull << 30), mean_bytes ? cache_bytes / mean_bytes : 0,
                    p99_bytes ? cache_bytes / p99_bytes : 0);
