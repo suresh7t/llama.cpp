@@ -6,7 +6,6 @@
 #include "llama-moe-provider.h"
 
 #include <atomic>
-#include <condition_variable>
 #include <deque>
 #include <map>
 #include <memory>
@@ -70,6 +69,7 @@ public:
         int pcie_m = 0;          // experts on the PCIe path, 0 = none
         const volatile int32_t * pcie_frac = nullptr;   // device address of the share, read by the kernels
         const hpcache_stage_args * stage = nullptr;
+        int32_t miss_id = 0;     // id of a missed expert in the pool ops: 0, or -1 when the matvec skips it
     };
 
 private:
@@ -152,12 +152,13 @@ private:
     void copier_submit(const std::vector<pending_swap> & jobs);
     void copier_wait();
     std::thread             copier;
-    std::mutex              copier_mutex;
-    std::condition_variable copier_cv;
-    std::condition_variable copier_done_cv;
+    hpcache_sync::spinlock  copier_lock;     // copier_jobs and the copy statistics
+    hpcache_sync::signal    copier_work;     // jobs queued or quit
+    hpcache_sync::signal    copier_done;     // the queued jobs have landed
     std::vector<pending_swap> copier_jobs;
-    bool                    copier_busy = false;
-    bool                    copier_quit = false;
+    std::atomic<bool>       copier_has_jobs{false};
+    std::atomic<bool>       copier_busy{false};
+    std::atomic<bool>       copier_quit{false};
 
     ggml_backend_t cpu = nullptr;
     hpcache_get_traits_fn get_traits = nullptr;
@@ -185,9 +186,8 @@ private:
     std::atomic<int64_t> decode_start_us{0};
 
     std::thread             thread;
-    std::mutex              mutex;
-    std::condition_variable cv;
+    hpcache_sync::signal    follower_sig;    // armed, idle or quit changed
     std::atomic<bool>       armed{false};
-    bool                    idle = true;
-    bool                    quit = false;
+    std::atomic<bool>       idle{true};
+    std::atomic<bool>       quit{false};
 };
