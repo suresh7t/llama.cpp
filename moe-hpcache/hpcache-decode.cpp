@@ -360,12 +360,9 @@ hpcache_decoder::~hpcache_decoder() {
                 (long long) n_swapped, swap_us / 1000.0);
         log(GGML_LOG_LEVEL_INFO, buf);
     }
-    {
-        std::lock_guard<std::mutex> lock(mutex);
-        quit = true;
-        armed.store(false);
-    }
-    cv.notify_all();
+    quit.store(true);
+    armed.store(false);
+    follower_sig.notify();
     if (thread.joinable()) {
         thread.join();
     }
@@ -385,11 +382,8 @@ hpcache_decoder::~hpcache_decoder() {
     }
 
     copier_wait();
-    {
-        std::lock_guard<std::mutex> lock(copier_mutex);
-        copier_quit = true;
-    }
-    copier_cv.notify_all();
+    copier_quit.store(true);
+    copier_work.notify();
     if (copier.joinable()) {
         copier.join();
     }
@@ -735,43 +729,49 @@ void hpcache_decoder::copier_main() {
     if (pool_device_index >= 0) {
         hpcache_cuda_set_device(pool_device_index);
     }
-    std::unique_lock<std::mutex> lock(copier_mutex);
     for (;;) {
-        copier_cv.wait(lock, [&] { return copier_quit || !copier_jobs.empty(); });
-        if (copier_jobs.empty()) {
+        copier_work.wait_until([&] { return copier_quit.load() || copier_has_jobs.load(); });
+        std::vector<pending_swap> jobs;
+        {
+            hpcache_sync::spin_guard guard(copier_lock);
+            jobs.swap(copier_jobs);
+            copier_has_jobs.store(false);
+        }
+        if (jobs.empty()) {
             break;
         }
-        std::vector<pending_swap> jobs;
-        jobs.swap(copier_jobs);
-        lock.unlock();
         const int64_t c0 = adm_now();
         for (const pending_swap & j : jobs) {
             copy_slot(*j.l, j.slot, j.expert);
         }
         hpcache_cuda_copy_wait();
         const int64_t c_us = adm_now() - c0;
-        lock.lock();
-        ++copy_batches;
-        copy_us_sum += c_us;
-        copy_us_max = std::max(copy_us_max, c_us);
-        copier_busy = false;
-        copier_done_cv.notify_all();
+        {
+            hpcache_sync::spin_guard guard(copier_lock);
+            ++copy_batches;
+            copy_us_sum += c_us;
+            copy_us_max = std::max(copy_us_max, c_us);
+        }
+        copier_busy.store(false);
+        copier_done.notify();
     }
 }
 
 void hpcache_decoder::copier_submit(const std::vector<pending_swap> & jobs) {
-    std::lock_guard<std::mutex> lock(copier_mutex);
     if (!copier.joinable()) {
         copier = std::thread([this] { copier_main(); });
     }
-    copier_jobs = jobs;
-    copier_busy = true;
-    copier_cv.notify_one();
+    {
+        hpcache_sync::spin_guard guard(copier_lock);
+        copier_jobs = jobs;
+    }
+    copier_busy.store(true);
+    copier_has_jobs.store(true);
+    copier_work.notify();
 }
 
 void hpcache_decoder::copier_wait() {
-    std::unique_lock<std::mutex> lock(copier_mutex);
-    copier_done_cv.wait(lock, [&] { return !copier_busy; });
+    copier_done.wait_until([&] { return !copier_busy.load(); });
 }
 
 // map the experts whose copies were queued by the previous round
@@ -781,11 +781,7 @@ void hpcache_decoder::publish_pending() {
     }
     {
         const int64_t w0 = adm_now();
-        bool blocked;
-        {
-            std::lock_guard<std::mutex> lock(copier_mutex);
-            blocked = copier_busy;
-        }
+        const bool blocked = copier_busy.load();
         copier_wait();
         const int64_t w_us = adm_now() - w0;
         ++pub_waits;
@@ -1027,6 +1023,17 @@ ggml_tensor * hpcache_decoder::build_layer(const llama_moe_layer_request & req) 
 
     op_ctx octx = { this, req.il, l->d_table };
     octx.n_expert = req.n_expert;
+    // ggml-cuda skips negative expert ids in the quantized matvec (mmvq.cu), so a missed expert costs nothing
+    static const bool skip_miss = [] { const char * e = getenv("HPCACHE_SKIP_MISS"); return e == nullptr || atoi(e) != 0; }();
+    if (skip_miss && l->n_slots > 0) {
+        bool quantized = true;
+        for (const ggml_tensor * t : { l->p_gate_up, l->p_gate, l->p_up, l->p_down }) {
+            quantized = quantized && (t == nullptr || ggml_is_quantized(t->type));
+        }
+        if (quantized) {
+            octx.miss_id = -1;
+        }
+    }
     if (l->pcie) {
         octx.pcie_m = std::min(opts.pcie_max, (int) req.n_expert_used);
         octx.pcie_frac = db.d_frac;
@@ -1119,7 +1126,7 @@ static void publish_cb(ggml_tensor * dst, int, int, void * userdata) {
 static void remap_ids_cb(ggml_tensor * dst, int, int, void * userdata) {
     auto * c = static_cast<hpcache_decoder::op_ctx *>(userdata);
     hpcache_cuda_remap_ids(ggml_custom_get_backend_stream(dst), (const int32_t *) dst->src[0]->data, c->table,
-            (int) dst->ne[0], (int32_t *) dst->data);
+            (int) dst->ne[0], c->miss_id, (int32_t *) dst->data);
 }
 
 static void remap_w_cb(ggml_tensor * dst, int, int, void * userdata) {
@@ -1163,6 +1170,16 @@ void hpcache_decoder::serve(uint32_t seq) {
         if (it != layers.end()) {
             l = it->second.get();
         }
+    }
+
+    // HPCACHE_BLIND=1: answer without any expert math, to time everything that is not math (diagnostic, output is garbage)
+    static const bool blind = getenv("HPCACHE_BLIND") != nullptr;
+    if (blind) {
+        memset(db.y, 0, size_t(db.n_embd) * sizeof(float));
+        n_serve++;
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        *db.flag = seq;
+        return;
     }
 
     const auto t_start = std::chrono::steady_clock::now();
@@ -1286,72 +1303,44 @@ void hpcache_decoder::serve(uint32_t seq) {
     HPCACHE_TRACE("served seq %u", seq);
 }
 
+// The follower makes no CUDA call: it reads the doorbell with plain loads and writes the answer to pinned host
+// memory. A CUDA call from this thread can wait behind a launch that is blocked on a full queue, and that launch
+// waits for the GPU, which waits for this thread. The kernels are pushed to the device by the launching thread.
 void hpcache_decoder::follower() {
     uint32_t seen = 0;
 
     for (;;) {
-        {
-            std::unique_lock<std::mutex> lock(mutex);
-            cv.wait(lock, [&] { return armed.load() || quit; });
-            if (quit) {
-                return;
-            }
+        follower_sig.wait_until([&] { return armed.load() || quit.load(); });
+        if (quit.load()) {
+            return;
         }
-
-        const int dev = device.load();
-        if (dev >= 0) {
-            hpcache_cuda_set_device(dev);
-        }
-
-        using clock = std::chrono::steady_clock;
-        auto last_flush = clock::now();
-        uint32_t spins = 0;
 
         while (armed.load(std::memory_order_acquire)) {
             const uint32_t seq = *db.seq;
             if (seq != seen) {
                 serve(seq);
                 seen = seq;
-                last_flush = clock::now();
                 continue;
             }
-
             HPCACHE_PAUSE();
-
-            // on WDDM the driver can hold queued work back, so nudge the submission now and then
-            if ((++spins & 1023u) == 0) {
-                const auto now = clock::now();
-                if (now - last_flush > std::chrono::milliseconds(2)) {
-                    void * s = stream.load();
-                    if (s != nullptr) {
-                        hpcache_cuda_flush(s);
-                    }
-                    last_flush = now;
-                }
-            }
         }
 
-        {
-            std::lock_guard<std::mutex> lock(mutex);
-            idle = true;
-        }
-        cv.notify_all();
+        idle.store(true);
+        follower_sig.notify();
     }
 }
 
+// called by the thread that runs the graph, never concurrently with end()
 void hpcache_decoder::arm() {
-    {
-        std::lock_guard<std::mutex> lock(mutex);
-        if (armed.load(std::memory_order_acquire)) {
-            return;
-        }
-        if (!thread.joinable()) {
-            thread = std::thread([this] { follower(); });
-        }
-        idle = false;
-        armed.store(true, std::memory_order_release);
+    if (armed.load(std::memory_order_acquire)) {
+        return;
     }
-    cv.notify_all();
+    if (!thread.joinable()) {
+        thread = std::thread([this] { follower(); });
+    }
+    idle.store(false);
+    armed.store(true, std::memory_order_release);
+    follower_sig.notify();
 }
 
 void hpcache_decoder::begin(const llama_moe_decode_info & info) {
@@ -1536,12 +1525,9 @@ void hpcache_decoder::end() {
     hpcache_cuda_sync_device();
     HPCACHE_TRACE("end: device synced");
 
-    {
-        std::unique_lock<std::mutex> lock(mutex);
-        armed.store(false, std::memory_order_release);
-        cv.notify_all();
-        cv.wait(lock, [&] { return idle; });
-    }
+    armed.store(false, std::memory_order_release);
+    follower_sig.notify();
+    follower_sig.wait_until([&] { return idle.load(); });
 
     if (cpu_pool) {
         cpu_pool->set_active(false);
