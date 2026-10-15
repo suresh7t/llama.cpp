@@ -3,10 +3,10 @@
 #include "ggml.h"
 #include "ggml-cpu.h"
 
+#include "hpcache-sync.h"
+
 #include <atomic>
-#include <condition_variable>
 #include <cstdint>
-#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -67,8 +67,7 @@ private:
     std::atomic<int>      bar_count{0};
     std::atomic<uint32_t> bar_gen{0};
 
-    std::mutex              mutex;
-    std::condition_variable cv;
+    hpcache_sync::signal    wake;
     std::atomic<bool>       active{false};
     std::atomic<bool>       quit{false};
 
