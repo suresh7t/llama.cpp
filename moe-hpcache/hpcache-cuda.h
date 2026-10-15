@@ -44,8 +44,6 @@ void hpcache_cuda_publish(void * stream, const hpcache_doorbell & db,
 // wait until the host served the last ring, then copy the CPU result to dst
 void hpcache_cuda_wait_merge(void * stream, const hpcache_doorbell & db, float * dst);
 
-// nonblocking, makes the driver submit queued work
-void hpcache_cuda_flush(void * stream);
 int  hpcache_cuda_get_device();
 void hpcache_cuda_set_device(int device);
 
@@ -74,7 +72,7 @@ bool hpcache_cuda_copy_to_device(void * dst, const void * src, size_t nbytes);
 bool hpcache_cuda_copy_wait();
 
 // device ids: pool slot of each routed expert, 0 for a miss
-void hpcache_cuda_remap_ids(void * stream, const int32_t * ids, const int32_t * table, int k, int32_t * out);
+void hpcache_cuda_remap_ids(void * stream, const int32_t * ids, const int32_t * table, int k, int32_t miss, int32_t * out);
 // device weights: the router weight of a hit, 0 for a miss
 void hpcache_cuda_remap_weights(void * stream, const int32_t * ids, const float * w, const int32_t * table, int k, float * out);
 

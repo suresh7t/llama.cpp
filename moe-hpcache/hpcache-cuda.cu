@@ -116,6 +116,22 @@ static __global__ void wait_merge_kernel(const volatile uint32_t * flag, const v
     }
 }
 
+// On WDDM the driver can hold queued launches back, and the wait kernel that follows a publish spins until the
+// CPU answers. Called by the thread that launched them, never by the follower: a query from another thread can
+// wait behind a launch that is blocked on a full queue.
+static void nudge_submission(cudaStream_t stream) {
+    // a query would invalidate a capture in progress
+    cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(stream, &status) != cudaSuccess) {
+        cudaGetLastError();
+        return;
+    }
+    if (status == cudaStreamCaptureStatusNone) {
+        (void) cudaStreamQuery(stream);
+        cudaGetLastError();   // not-ready is not an error, and the core checks the last error after its launches
+    }
+}
+
 void hpcache_cuda_publish(void * stream, const hpcache_doorbell & db,
         const float * x, const int32_t * ids, const float * w, int layer) {
     publish_kernel<<<1, 256, 0, (cudaStream_t) stream>>>(x, ids, w, db.n_embd, db.k, layer,
@@ -124,6 +140,7 @@ void hpcache_cuda_publish(void * stream, const hpcache_doorbell & db,
     if (err != cudaSuccess) {
         fprintf(stderr, "moe-hpcache: publish kernel launch failed: %s\n", cudaGetErrorString(err));
     }
+    nudge_submission((cudaStream_t) stream);
 }
 
 void hpcache_cuda_wait_merge(void * stream, const hpcache_doorbell & db, float * dst) {
@@ -132,18 +149,7 @@ void hpcache_cuda_wait_merge(void * stream, const hpcache_doorbell & db, float *
     if (err != cudaSuccess) {
         fprintf(stderr, "moe-hpcache: wait kernel launch failed: %s\n", cudaGetErrorString(err));
     }
-}
-
-void hpcache_cuda_flush(void * stream) {
-    // a query would invalidate a capture in progress
-    cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
-    if (cudaStreamIsCapturing((cudaStream_t) stream, &status) != cudaSuccess) {
-        cudaGetLastError();
-        return;
-    }
-    if (status == cudaStreamCaptureStatusNone) {
-        (void) cudaStreamQuery((cudaStream_t) stream);
-    }
+    nudge_submission((cudaStream_t) stream);
 }
 
 int hpcache_cuda_get_device() {
@@ -237,11 +243,13 @@ bool hpcache_cuda_copy_wait() {
     return s != nullptr && cudaStreamSynchronize(s) == cudaSuccess;
 }
 
-static __global__ void remap_ids_kernel(const int32_t * ids, const int32_t * table, int k, int32_t * out) {
+// miss is the id written for an expert that is not in the pool: 0 computes slot 0 and the weight of that column is
+// zero, a negative id makes the quantized matvec of ggml-cuda skip the column (mmvq.cu)
+static __global__ void remap_ids_kernel(const int32_t * ids, const int32_t * table, int k, int32_t miss, int32_t * out) {
     const int i = threadIdx.x;
     if (i < k) {
         const int32_t slot = table[ids[i]];
-        out[i] = slot >= 0 ? slot : 0;
+        out[i] = slot >= 0 ? slot : miss;
     }
 }
 
@@ -252,8 +260,8 @@ static __global__ void remap_weights_kernel(const int32_t * ids, const float * w
     }
 }
 
-void hpcache_cuda_remap_ids(void * stream, const int32_t * ids, const int32_t * table, int k, int32_t * out) {
-    remap_ids_kernel<<<1, 32, 0, (cudaStream_t) stream>>>(ids, table, k, out);
+void hpcache_cuda_remap_ids(void * stream, const int32_t * ids, const int32_t * table, int k, int32_t miss, int32_t * out) {
+    remap_ids_kernel<<<1, 32, 0, (cudaStream_t) stream>>>(ids, table, k, miss, out);
 }
 
 void hpcache_cuda_remap_weights(void * stream, const int32_t * ids, const float * w, const int32_t * table, int k, float * out) {
