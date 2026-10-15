@@ -57,10 +57,7 @@ hpcache_cpu_pool::~hpcache_cpu_pool() {
                 g_ph[5] * k, g_ph[6] * k, g_ph[7] * k);
     }
     quit.store(true);
-    {
-        std::lock_guard<std::mutex> lock(mutex);
-    }
-    cv.notify_all();
+    wake.notify();
     for (auto & t : threads) {
         t.join();
     }
@@ -352,10 +349,9 @@ bool hpcache_cpu_pool::describe(hpcache_expert_desc & d, ggml_type gate, ggml_ty
 
 void hpcache_cpu_pool::set_active(bool a) {
     {
-        std::lock_guard<std::mutex> lock(mutex);
         active.store(a, std::memory_order_release);
     }
-    cv.notify_all();
+    wake.notify();
 }
 
 void hpcache_cpu_pool::worker(int ith) {
@@ -375,8 +371,7 @@ void hpcache_cpu_pool::worker(int ith) {
 
         HPCACHE_PAUSE();
         if ((++spins & 0xfffffu) == 0 && !active.load(std::memory_order_acquire)) {
-            std::unique_lock<std::mutex> lock(mutex);
-            cv.wait(lock, [&] { return active.load(std::memory_order_acquire) || quit.load(); });
+            wake.wait_until([&] { return active.load(std::memory_order_acquire) || quit.load(); });
         }
     }
 }
