@@ -14,6 +14,7 @@ set(HPCACHE_SOURCES
     hpcache-scheduler.h
     hpcache.cpp
     hpcache.h
+    hpcache-sync.h
 )
 
 # the doorbell decode needs the CUDA runtime for pinned memory and three small kernels
@@ -53,11 +54,14 @@ target_link_libraries(${TARGET} PUBLIC ggml vendor::nlohmann vendor::sheredom)
 target_compile_features(${TARGET} PUBLIC cxx_std_17)
 
 if (HPCACHE_WITH_CUDA)
-    target_link_libraries(${TARGET} PUBLIC CUDA::cudart_static)
+    # the shared runtime, like ggml-cuda: one runtime instance and one context per process
+    target_link_libraries(${TARGET} PUBLIC CUDA::cudart)
     target_compile_definitions(${TARGET} PRIVATE HPCACHE_CUDA)
 endif()
 
 if (WIN32)
+    # WaitOnAddress and WakeByAddress (hpcache-sync.h)
+    target_link_libraries(${TARGET} PRIVATE synchronization)
     set_target_properties(${TARGET} PROPERTIES OUTPUT_NAME moe-hpcache)
 else()
     set_target_properties(${TARGET} PROPERTIES OUTPUT_NAME moe-hpcache PREFIX "")
