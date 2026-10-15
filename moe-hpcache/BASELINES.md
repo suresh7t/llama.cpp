@@ -520,3 +520,50 @@ cover both positions, and its usage counters feed on both, so the adaptive tier 
 Per generated token Strata fetches about 9.2 distinct missed experts per layer, this provider about 5.7. The real
 token's hit rate in Strata is not observable from its output; if the constant token hits at 60-70% it is 30-40%, below
 the 43% here. The no-draft speeds (21.7-21.9 t/s) are comparable; the hit rates are not.
+
+## MTP draft head with stock llama.cpp (2026-10-12, `mtp_server.ps1`)
+
+Official head `ggml-org/Qwen3.8-Flash-Next-GGUF` `mtp-Qwen3.8-Flash-Next-Q4_0.gguf` (2098 MiB: 1 MTP block of 512 experts
+plus embeddings and head) as `--spec-draft-model`, `--spec-type draft-mtp`, main model GSQ-RCO IQ3_XXS with
+`--cpu-moe`, draft experts on the CPU (`--spec-draft-cpu-moe`), `-c 4096 -ub 128`, greedy, 200 tokens, lighthouse prompt,
+no provider (stock expert path), `llama-server`:
+
+| | draft max | acceptance | tokens per round | generation |
+|---|---|---|---|---|
+| no drafts | | | 1 | 7.74 t/s |
+| MTP draft | 3 | 125 / 219 = **0.571** | 2.71 | 6.60 t/s |
+
+Strata's head on the same prompt: 0.578 (74 of 128), 2.35 tokens per round with a window of 6. The acceptance is the
+same. Stock llama.cpp loses 15% with drafts here: the verify step of 4 tokens and the three draft steps all run the
+experts on the CPU without any reuse across the window, which is what the provider path would change. Starting
+`--spec-draft-model` with the main model's `-ngl 99` and `-ub 512` ran out of device memory in the draft context's compute
+buffer (578 MiB); `-ub 128` fits.
+
+## Provider no-draft after the sync, bind and pool-fraction changes (2026-10-14)
+
+`llama-cli`, `--device CUDA0 -t 6 -ub 128 -c 36864`, greedy, 400 tokens, 24-token prompt, CUDA 12.6 build, 96 GB RAM at
+3200 MT/s, display on the GTX 1050 (not on the 3060 Ti). Profile: Strata `expert-profile.bin`. `HPCACHE_STATS_EVERY=100`.
+
+| KV | Plan | Reserve | Pool slots | Hit rate (window 300) | ms/step | Generation |
+|---|---|---|---|---|---|---|
+| f16 | 80% | 700 MiB | 878 | 44-52% | 42.8 | 22.0-22.3 t/s |
+| q5_0 | 80% | 700 MiB | 1274 | 56% | 41.6 | 22.9 t/s |
+| q5_0 | 80% | 300 MiB | 1305 | 63% | 41.2 | 23.1 t/s |
+| q5_0 | 83% (default) | derived 654 MiB | 1300 | 53-54% | 41.0 | **23.2 t/s** (2 runs) |
+| q5_0 | 85% | derived 654 MiB | 1300 | 57% | 41.0 | 23.1 t/s |
+| q5_0, `-c 16384` | 83% | derived | 1417 | 54% | 41.0 | 23.3 t/s |
+| q5_0, `-c 8192` | 83% | derived | 1457 | 62% | 40.7 | 23.4 t/s |
+
+- The pool is `min(plan + 10%, free VRAM - reserve)`. At `-c 36864` free VRAM at pool time is 2972 MiB, so the pool is
+  about 2.3 GiB whatever the plan fraction above 83%. A plan with a larger expert cache and `reserve_mib=300` failed
+  ("failed to allocate compute pp buffers"): the compute buffers at `-ub 128` need about 550 MiB.
+- The default reserve is derived from `-ub` (450 + 1.6 * ub MiB), so `reserve_mib` is not needed.
+- With the display attached to the 3060 Ti, the same build ran 15-17 t/s with copy spikes up to 60 ms.
+- Sync primitives (address-wait signal and spinlock in `hpcache-sync.h`) and the single shared cudart did not change
+  throughput; copier wait stays at 0.1 us.
+- Hang at the first decode step (about 1 run in 10, timing dependent): the GPU spins in the wait kernel for the CPU
+  answer while the follower thread is blocked in a CUDA call (`cudaSetDevice`, then the periodic `cudaStreamQuery`
+  flush) behind a launch that is blocked on a full launch queue. Fixed by making the follower thread free of CUDA calls;
+  the launching thread nudges the submission after its publish and wait launches (`nudge_submission` in
+  `hpcache-cuda.cu`). Throughput unchanged (23.1 and 22.9 t/s).
+- No MTP in the provider yet; all numbers are no-draft.
