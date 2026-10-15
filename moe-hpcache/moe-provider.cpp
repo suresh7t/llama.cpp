@@ -8,15 +8,21 @@
 #include <cstdint>
 #include <cstdlib>
 #include <exception>
+#include <filesystem>
 #include <fstream>
 #include <memory>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#else
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
 #endif
 
 #include <vector>
@@ -74,6 +80,81 @@ std::string pin_process(const std::string & cpu_list, int n_cores_wanted) {
 #endif
 }
 
+// The directory of the host executable, where the provider library and the calibrate tool are installed.
+std::filesystem::path executable_directory() {
+#if defined(_WIN32)
+    std::vector<wchar_t> buffer(512);
+    for (;;) {
+        const DWORD length = GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
+        if (length == 0) {
+            return {};
+        }
+        if (length < buffer.size() - 1) {
+            return std::filesystem::path(buffer.data(), buffer.data() + length).parent_path();
+        }
+        buffer.resize(buffer.size() * 2);
+    }
+#else
+    std::vector<char> buffer(4096);
+    const ssize_t length = readlink("/proc/self/exe", buffer.data(), buffer.size() - 1);
+    if (length <= 0) {
+        return {};
+    }
+    buffer[static_cast<size_t>(length)] = '\0';
+    return std::filesystem::path(buffer.data()).parent_path();
+#endif
+}
+
+// Run a program with the console of this process and wait for it; its exit code, or -1 when it could not start.
+int run_process(const std::vector<std::string> & argv) {
+#if defined(_WIN32)
+    std::wstring command;
+    for (const std::string & arg : argv) {
+        std::wstring wide = std::filesystem::path(arg).wstring();
+        command += command.empty() ? L"" : L" ";
+        command += L"\"";
+        for (wchar_t c : wide) {
+            if (c == L'"') {
+                command += L"\\";
+            }
+            command += c;
+        }
+        command += L"\"";
+    }
+    STARTUPINFOW si = {};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi = {};
+    if (!CreateProcessW(nullptr, command.data(), nullptr, nullptr, TRUE, 0, nullptr, nullptr, &si, &pi)) {
+        return -1;
+    }
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD code = 1;
+    GetExitCodeProcess(pi.hProcess, &code);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return int(code);
+#else
+    std::vector<char *> args;
+    for (const std::string & arg : argv) {
+        args.push_back(const_cast<char *>(arg.c_str()));
+    }
+    args.push_back(nullptr);
+    const pid_t pid = fork();
+    if (pid < 0) {
+        return -1;
+    }
+    if (pid == 0) {
+        execv(args[0], args.data());
+        _exit(127);
+    }
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0) {
+        return -1;
+    }
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+#endif
+}
+
 struct hpcache_provider {
     llama_moe_provider_api api = {};
     const llama_moe_host * host = nullptr;
@@ -94,26 +175,138 @@ struct hpcache_provider {
         }
     }
 
+    std::string param(const char * name) const {
+        const char * value = host->get_param != nullptr ? host->get_param(host->ctx, name) : nullptr;
+        return value != nullptr ? value : "";
+    }
+
+    static bool read_plan_file(const std::string & path, common_moe_hpcache_plan & out) {
+        std::ifstream input(path, std::ios::binary);
+        if (!input) {
+            return false;
+        }
+        std::ostringstream contents;
+        contents << input.rdbuf();
+        out = common_moe_hpcache_parse_plan(common_json::parse(contents.str()));
+        return true;
+    }
+
+    // Why the plan generated for the default file no longer fits this run, empty when it does.
+    std::string stale_reason(const common_moe_hpcache_plan & found) const {
+        const std::string model = param("model");
+        if (!model.empty() && found.model != model) {
+            return "it was made for another model";
+        }
+        const uint32_t n_ctx = uint32_t(atoll(param("n_ctx").c_str()));
+        if (n_ctx > 0 && found.context_tokens != n_ctx) {
+            return "it was made for context " + std::to_string(found.context_tokens) + ", this run uses " + std::to_string(n_ctx);
+        }
+        const std::string ctk = param("ctk");
+        const std::string ctv = param("ctv");
+        if ((!ctk.empty() && found.cache_type_k != ctk) || (!ctv.empty() && found.cache_type_v != ctv)) {
+            return "it was made for KV types " + found.cache_type_k + "/" + found.cache_type_v + ", this run uses " + ctk + "/" + ctv;
+        }
+        return "";
+    }
+
+    // Run the calibrate tool that sits next to the server and let it write the plan file.
+    void run_calibration(const std::string & path) {
+        const std::string model = param("model");
+        if (model.empty()) {
+            throw std::runtime_error("cannot calibrate, the model path is not known");
+        }
+        const std::string ctk = param("ctk");
+        const std::string ctv = param("ctv");
+        for (const std::string & type : {ctk, ctv}) {
+            if (!type.empty() && type != "f16" && type != "q5_0") {
+                throw std::runtime_error("automatic calibration supports KV types f16 and q5_0 only (this run uses " + type +
+                        "), make a plan with llama-hpcache-calibrate and pass plan=<file>");
+            }
+        }
+
+        std::vector<std::string> argv;
+#if defined(_WIN32)
+        argv.push_back((executable_directory() / "llama-hpcache-calibrate.exe").string());
+#else
+        argv.push_back((executable_directory() / "llama-hpcache-calibrate").string());
+#endif
+        std::error_code ec;
+        if (!std::filesystem::exists(argv[0], ec)) {
+            throw std::runtime_error("cannot calibrate, " + argv[0] + " not found, build the llama-hpcache-calibrate target");
+        }
+        argv.insert(argv.end(), {"-m", model, "-o", path});
+        const std::string n_ctx = param("n_ctx");
+        if (atoll(n_ctx.c_str()) > 0) {
+            argv.insert(argv.end(), {"-ctx", n_ctx});
+        }
+        if (!ctk.empty()) {
+            argv.insert(argv.end(), {"-ctk", ctk});
+        }
+        if (!ctv.empty()) {
+            argv.insert(argv.end(), {"-ctv", ctv});
+        }
+        if (host->get_devices != nullptr) {
+            llama_moe_device_info infos[16] = {};
+            const int32_t n = host->get_devices(host->ctx, infos, 16);
+            std::string names;
+            for (int32_t i = 0; i < n; ++i) {
+                if (infos[i].type != GGML_BACKEND_DEVICE_TYPE_CPU && infos[i].name != nullptr) {
+                    names += (names.empty() ? "" : ",") + std::string(infos[i].name);
+                }
+            }
+            if (!names.empty()) {
+                argv.insert(argv.end(), {"-dev", names});
+            }
+        }
+
+        log(GGML_LOG_LEVEL_INFO, "no usable plan, running the calibration (this takes a few minutes the first time)");
+        const int code = run_process(argv);
+        if (code != 0) {
+            throw std::runtime_error("calibration failed with exit code " + std::to_string(code));
+        }
+        log(GGML_LOG_LEVEL_INFO, "calibration written to " + path);
+    }
+
     void load_plan(const char * args) {
         const char * value = host->get_param != nullptr ? host->get_param(host->ctx, "plan") : nullptr;
         std::string path = value != nullptr ? value : (args != nullptr ? args : "");
         if (path.rfind("plan=", 0) == 0) {
             path.erase(0, 5);
         }
-        if (path.empty()) {
-            throw std::runtime_error("missing plan, use --moe-provider-args plan=<plan.json>");
+        // no plan given: use the calibration file in the working directory, and make it when it is missing or stale
+        const bool explicit_plan = !path.empty();
+        if (!explicit_plan) {
+            path = "hpcache-calibration.json";
         }
 
-        std::ifstream input(path, std::ios::binary);
-        if (!input) {
-            throw std::runtime_error("cannot open plan " + path);
+        std::string reason;
+        common_moe_hpcache_plan found;
+        try {
+            if (!read_plan_file(path, found)) {
+                reason = path + " does not exist";
+            } else if (!explicit_plan) {
+                const std::string stale = stale_reason(found);
+                if (!stale.empty()) {
+                    reason = path + " is out of date: " + stale;
+                }
+            }
+        } catch (const std::exception & e) {
+            if (explicit_plan) {
+                throw;
+            }
+            reason = path + " cannot be used: " + e.what();
         }
-        std::ostringstream contents;
-        contents << input.rdbuf();
-        plan = common_moe_hpcache_parse_plan(common_json::parse(contents.str()));
+        if (!reason.empty()) {
+            log(GGML_LOG_LEVEL_INFO, reason);
+            run_calibration(path);
+            if (!read_plan_file(path, found)) {
+                throw std::runtime_error("cannot open plan " + path);
+            }
+        }
+        plan = std::move(found);
 
-        const char * model = host->get_param != nullptr ? host->get_param(host->ctx, "model") : nullptr;
-        if (model != nullptr && plan.model != model) {
+        const std::string model = param("model");
+        if (!model.empty() && plan.model != model) {
             throw std::runtime_error("plan model does not match the loaded model");
         }
     }
