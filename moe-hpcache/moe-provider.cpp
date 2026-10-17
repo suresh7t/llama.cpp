@@ -441,6 +441,12 @@ extern "C" MOE_HPCACHE_EXPORT const llama_moe_provider_api * llama_moe_provider_
             const int64_t ub = atoll(param("n_ubatch").c_str());
             pool.reserve_bytes = size_t(450 + ub * 8 / 5) << 20;
         }
+        if (!param("grow").empty()) {
+            pool.grow = atoi(param("grow").c_str()) != 0;
+        }
+        if (!param("grow_margin_mib").empty()) {
+            pool.grow_margin_bytes = size_t(atoll(param("grow_margin_mib").c_str())) << 20;
+        }
         if (param("kernel") == "ggml") {
             pool.cpu_kernel = false;
         }

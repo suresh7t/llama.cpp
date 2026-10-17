@@ -12,6 +12,13 @@
 #include <tuple>
 #include <string>
 
+#ifdef _WIN32
+#    define WIN32_LEAN_AND_MEAN
+#    include <windows.h>
+#else
+#    include <dlfcn.h>
+#endif
+
 static bool trace_enabled() {
     static const bool enabled = getenv("HPCACHE_TRACE") != nullptr;
     return enabled;
@@ -680,6 +687,216 @@ void hpcache_decoder::alloc_pool(layer & l, int il) {
     flush_tables();
 }
 
+// Free memory of the pool device as total minus used, read from NVML. cudaMemGetInfo reports 0 once the share the OS
+// grants the process is reached, although the card still has room. Falls back to the backend when NVML is missing.
+struct nvml_memory { unsigned long long total, free, used; };
+
+static bool nvml_used_bytes(const char * pci_bus_id, size_t & total, size_t & used) {
+    static void * lib = nullptr;
+    static int (*get_handle)(const char *, void **) = nullptr;
+    static int (*get_memory)(void *, nvml_memory *) = nullptr;
+    static bool tried = false;
+    if (!tried) {
+        tried = true;
+#ifdef _WIN32
+        HMODULE h = LoadLibraryA("nvml.dll");
+        lib = (void *) h;
+        auto sym = [&](const char * name) { return h ? (void *) GetProcAddress(h, name) : nullptr; };
+#else
+        lib = dlopen("libnvidia-ml.so.1", RTLD_NOW);
+        auto sym = [&](const char * name) { return lib ? dlsym(lib, name) : nullptr; };
+#endif
+        auto init = (int (*)()) sym("nvmlInit_v2");
+        get_handle = (int (*)(const char *, void **)) sym("nvmlDeviceGetHandleByPciBusId_v2");
+        get_memory = (int (*)(void *, nvml_memory *)) sym("nvmlDeviceGetMemoryInfo");
+        if (init == nullptr || init() != 0) {
+            get_handle = nullptr;
+        }
+    }
+    void * dev = nullptr;
+    nvml_memory m = {};
+    if (get_handle == nullptr || get_memory == nullptr || pci_bus_id == nullptr || get_handle(pci_bus_id, &dev) != 0 ||
+        get_memory(dev, &m) != 0) {
+        return false;
+    }
+    total = (size_t) m.total;
+    used  = (size_t) m.used;
+    return true;
+}
+
+void hpcache_decoder::device_free_bytes(size_t & free_bytes, size_t & total_bytes) const {
+    ggml_backend_dev_props props = {};
+    ggml_backend_dev_get_props(pool_dev, &props);
+    size_t used = 0;
+    if (nvml_used_bytes(props.device_id, total_bytes, used)) {
+        free_bytes = total_bytes > used ? total_bytes - used : 0;
+    } else {
+        ggml_backend_dev_memory(pool_dev, &free_bytes, &total_bytes);
+    }
+}
+
+// The pool is built before the compute buffer of the decode graph exists, so it leaves a reserve for it. Once that
+// buffer is allocated, what is still free is idle: add slots to the layers from the next ranks of the profile.
+// The pool tensors are referenced by the graph, so they keep their identity: only data, buffer and slot count change.
+//
+// The first failed allocation ends the growth. NVML still reports a few hundred MiB free at that point (about 330 MiB on
+// the 8 GiB RTX 3060 Ti, where the process peaks near 7.7 GiB), and a 27 MiB request fails as well as an 80 MiB one, so
+// smaller slots or fewer slots per layer do not help. The driver and WDDM keep a pool of their own for memory
+// management (free-space bookkeeping, page tables) that the process cannot allocate from. The DXGI budget of the card
+// is 7256 MiB of 8024 MiB (IDXGIAdapter3::QueryVideoMemoryInfo). Growing adds about 80 slots (+1 point of hit rate), no measurable
+// speed.
+void hpcache_decoder::grow_pool() {
+    if (pool_dev == nullptr || pool_used == 0) {
+        return;   // no pool yet (a warm-up decode before the graph with the pool), try again at the next decode
+    }
+    pool_grown = true;
+    if (!opts.grow || profile.empty()) {
+        return;
+    }
+    copier_wait();
+    if (!pending.empty()) {
+        return;
+    }
+    hpcache_cuda_set_device(pool_device_index);
+
+    size_t free_bytes = 0, total_bytes = 0;
+    device_free_bytes(free_bytes, total_bytes);
+
+    const size_t keep = opts.grow_margin_bytes;
+    if (free_bytes <= keep) {
+        char msg[200];
+        snprintf(msg, sizeof(msg), "GPU expert pool not grown: %.0f MiB free, the margin needs %.0f MiB",
+                free_bytes / 1048576.0, keep / 1048576.0);
+        log(GGML_LOG_LEVEL_INFO, msg);
+        return;
+    }
+    size_t avail = free_bytes - keep;
+    bool full = false;   // an allocation failed: the device is at capacity
+
+    // the next ranks of the profile that the layers can take
+    std::map<layer *, std::vector<int>> added;
+    int64_t n_added = 0;
+    int64_t rank = pool_rank_limit;
+    for (; rank < (int64_t) profile.size(); ++rank) {
+        const int il = profile[rank].first;
+        const int e  = profile[rank].second;
+        auto it = layers.find(il);
+        if (it == layers.end()) {
+            continue;
+        }
+        layer & l = *it->second;
+        if (l.n_slots == 0 || l.p_gate_up != nullptr || e >= l.n_expert || l.slot_of[e] >= 0) {
+            continue;
+        }
+        std::vector<int> & v = added[&l];
+        if (l.n_slots + (int) v.size() >= l.n_expert || std::find(v.begin(), v.end(), e) != v.end()) {
+            continue;
+        }
+        size_t slot_bytes = 0;
+        for (const ggml_tensor * t : { l.p_gate, l.p_up, l.p_down }) {
+            slot_bytes += t != nullptr ? t->nb[2] : 0;
+        }
+        if (slot_bytes > avail) {
+            break;
+        }
+        avail -= slot_bytes;
+        v.push_back(e);
+        ++n_added;
+    }
+
+    int64_t n_grown = 0;
+    size_t  added_bytes = 0;
+    int     n_layers_grown = 0;
+    for (auto & entry : added) {
+        layer & l = *entry.first;
+        const std::vector<int> & extra = entry.second;
+        if (extra.empty()) {
+            continue;
+        }
+        const int n_old = l.n_slots;
+        const int n_new = n_old + (int) extra.size();
+
+        ggml_tensor * cur[4] = { l.p_gate, l.p_up, l.p_down, nullptr };
+        // the old buffer goes first: its slots come again from the host copies, so the layer needs no room twice
+        hpcache_cuda_sync_device();
+        ggml_backend_buffer_free(l.pool_buf);
+        l.pool_buf = nullptr;
+        int n_got = n_old;
+        ggml_backend_buffer_t buf = nullptr;
+        for (int n_try : { n_new, n_old }) {
+            ggml_init_params params = { ggml_tensor_overhead() * 8, nullptr, true };
+            ggml_context * ctx = ggml_init(params);
+            ggml_tensor * fresh[4] = { nullptr, nullptr, nullptr, nullptr };
+            for (int i = 0; i < 3; ++i) {
+                if (cur[i] != nullptr) {
+                    fresh[i] = ggml_new_tensor_3d(ctx, cur[i]->type, cur[i]->ne[0], cur[i]->ne[1], n_try);
+                }
+            }
+            buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_dev_buffer_type(pool_dev));
+            if (buf != nullptr) {
+                for (int i = 0; i < 3; ++i) {
+                    if (cur[i] != nullptr) {
+                        cur[i]->buffer = fresh[i]->buffer;
+                        cur[i]->data   = fresh[i]->data;
+                        cur[i]->ne[2]  = n_try;
+                        cur[i]->nb[3]  = fresh[i]->nb[3];
+                    }
+                }
+            }
+            ggml_free(ctx);
+            if (buf != nullptr) {
+                n_got = n_try;
+                break;
+            }
+            full = true;   // out of memory, the second try puts the old size back
+        }
+        GGML_ASSERT(buf != nullptr);
+        l.pool_buf = buf;
+        const int n_extra = n_got - n_old;
+        l.slot_expert.resize(n_got, -1);
+
+        // the old contents come again from the host copies, then the new experts fill the new slots
+        for (int s = 0; s < n_old; ++s) {
+            if (l.slot_expert[s] >= 0) {
+                copy_slot(l, s, l.slot_expert[s]);
+            }
+        }
+        for (int j = 0; j < n_extra; ++j) {
+            if (!load_slot(l, n_old + j, extra[j])) {
+                break;
+            }
+            l.score[extra[j]] = 3.0f;
+        }
+        hpcache_cuda_copy_wait();
+        hpcache_cuda_sync_device();
+        l.n_slots = n_got;
+        stage_table(l);
+        if (n_extra == 0) {
+            break;   // the first out-of-memory is the capacity, nothing more fits after it
+        }
+
+        size_t slot_bytes = 0;
+        for (const ggml_tensor * t : { l.p_gate, l.p_up, l.p_down }) {
+            slot_bytes += t != nullptr ? t->nb[2] : 0;
+        }
+        added_bytes += slot_bytes * n_extra;
+        n_grown += n_extra;
+        ++n_layers_grown;
+    }
+    flush_tables();
+    pool_used += added_bytes;
+    pool_slots += n_grown;
+    pool_rank_limit = std::min<int64_t>(rank, (int64_t) profile.size());
+
+    size_t free_after = 0;
+    device_free_bytes(free_after, total_bytes);
+    char buf[256];
+    snprintf(buf, sizeof(buf), "GPU expert pool grown: +%lld slots in %d layers (+%.0f MiB), free %.0f -> %.0f MiB, margin %.0f MiB%s",
+            (long long) n_grown, n_layers_grown, added_bytes / 1048576.0, free_bytes / 1048576.0, free_after / 1048576.0,
+            opts.grow_margin_bytes / 1048576.0, full ? ", device full" : "");
+    log(GGML_LOG_LEVEL_INFO, buf);
+}
+
 void hpcache_decoder::stage_table(layer & l) {
     if (l.h_table == nullptr) {
         return;
@@ -1003,6 +1220,7 @@ ggml_tensor * hpcache_decoder::build_layer(const llama_moe_layer_request & req) 
             pending.clear();
             layers.clear();
             pool_init = false;
+            pool_grown = false;
             pool_used = 0;
             pool_dev = nullptr;
             profile.clear();
@@ -1349,6 +1567,9 @@ void hpcache_decoder::begin(const llama_moe_decode_info & info) {
         return;
     }
     HPCACHE_TRACE("begin");
+    if (!pool_grown) {
+        grow_pool();
+    }
     if (cpu_pool) {
         cpu_pool->set_active(true);
     }

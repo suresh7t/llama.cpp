@@ -36,6 +36,8 @@ struct hpcache_pool_options {
     size_t      pin_bytes     = 0;                 // most that is page-locked, 0 = all of it
     size_t      arena_bytes   = 0;                 // cap of that region, 0 = the size of the expert weights
     bool        spare_slot    = false;             // one unmapped slot per layer receives the copy, the victim stays mapped until it lands
+    bool        grow          = true;              // at the first decode, add slots from the device memory that is still free
+    size_t      grow_margin_bytes = size_t(150) << 20;   // left free after growing
 };
 
 // Single-token decode of the routed experts through a doorbell: the GPU publishes the router
@@ -83,6 +85,8 @@ private:
     cpu_graph * cpu_graph_for(layer & l, int n_miss);
     void init_pool(const llama_moe_layer_request & req);
     void alloc_pool(layer & l, int il);
+    void grow_pool();
+    void device_free_bytes(size_t & free_bytes, size_t & total_bytes) const;
     bool copy_slot(layer & l, int slot, int e);
     bool load_slot(layer & l, int slot, int e);
     void publish_pending();
@@ -124,6 +128,7 @@ private:
     ggml_backend_dev_t pool_dev = nullptr;
     int      pool_device_index = -1;
     bool     pool_init = false;
+    bool     pool_grown = false;                  // grow_pool() has run for this pool
     size_t   pool_budget = 0;
     size_t   pool_used = 0;
     int64_t  pool_slots = 0;
