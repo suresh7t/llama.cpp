@@ -75,11 +75,21 @@ The existing ggml backend implementations remain responsible for performing the 
 
 # 3. Relationship to llama.cpp Discussion #14514
 
-Discussion **#14514** is the primary architectural reference for HP execution.
+Discussion **#14514** ("Increase CPU & GPU execution overlap of GGML Backends through the new Graph Plan API") is
+related groundwork, not a specification of HP execution.
 
-The relevant idea is the evolution of ggml's graph execution/planning model toward allowing execution to be planned around backend capabilities and, importantly, allowing independent work to overlap rather than treating execution as a strictly serialized sequence.
+It proposes making the existing Graph Plan API (create, update, compute, free) report what may change and what changed
+between calls, so a backend can skip graph traversal, reduce launch overhead and keep the GPU busy. It says nothing
+about MoE, expert placement, or splitting one operation across CPU, CUDA and Vulkan, and it is still open and
+exploratory.
 
-HP should build on this direction rather than introduce a parallel execution framework outside ggml.
+`moe-hpcache` does not use the Graph Plan API. The execution design (doorbell, CPU follower thread, merge on the GPU
+stream) is our own, built from custom ops. The one link is launch overhead: custom ops with a backend stream disable CUDA
+graph reuse for the graph that contains them, so if the Graph Plan API lands it may be a way to make them replay safe.
+That is a possible follow-up, not a dependency.
+
+HP should still work with the existing ggml backend machinery rather than introduce a parallel execution framework
+outside ggml.
 
 The central question for `moe-hpcache` is therefore:
 
@@ -237,9 +247,9 @@ Thus:
 
 **#24528 → residency/cache**
 
-**#14514 → graph/backend execution architecture**
+**#14514 → related groundwork on graph planning and launch overhead (not an HP specification)**
 
-**`moe-hpcache` → integrates the two through MoE scheduling**
+**`moe-hpcache` → its own doorbell execution and scheduling, with #24528 as the residency reference**
 
 ---
 
@@ -457,7 +467,7 @@ The implementation should use ggml operations wherever possible rather than intr
 
 ---
 
-# 11. Why #14514 Matters
+# 11. Why #14514 Is Related
 
 The major architectural question is not:
 
@@ -469,7 +479,7 @@ The question is:
 
 > "How do we represent and schedule independent operations so that existing ggml backends can execute them concurrently?"
 
-This is where the execution/planning direction discussed in **#14514** becomes important.
+This is the question #14514 touches from the side: it is about plan reuse and overlap, and does not answer it for MoE.
 
 The desired model is:
 
@@ -537,7 +547,7 @@ backend B operation                      │
 
 # 13. Proposed Development Sequence
 
-### Step 1 — Understand #14514
+### Step 1 — Understand graph planning (#14514, related only)
 
 Map the discussion's proposed/current graph-planning architecture to the current llama.cpp source tree.
 
