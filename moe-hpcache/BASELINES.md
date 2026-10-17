@@ -567,3 +567,18 @@ buffer (578 MiB); `-ub 128` fits.
   the launching thread nudges the submission after its publish and wait launches (`nudge_submission` in
   `hpcache-cuda.cu`). Throughput unchanged (23.1 and 22.9 t/s).
 - No MTP in the provider yet; all numbers are no-draft.
+
+## GPU memory left after the first decode (2026-10-16, RTX 3060 Ti 8 GiB, Windows, driver 581.08)
+
+The pool is sized before the decode compute buffer exists, so the provider tries to add slots at the first decode
+(`grow_pool`, provider args `grow=0|1`, `grow_margin_mib`). Free memory is read from NVML (total minus used), because
+`cudaMemGetInfo` reports 0 MiB free from the first decode on.
+
+- The first failed allocation ends the growth. NVML still shows about 330 MiB free then, and a 27 MiB request fails as
+  well as an 80 MiB one, also when only one slot is added to a layer. The process peaks near 7.7 GiB (`nvidia-smi`).
+- The driver and WDDM keep a pool of their own for memory management that the process cannot allocate from. The DXGI
+  budget of the card is 7256 MiB of 8024 MiB (`claude/wddm-budget`), and it is advisory (the peak goes above it).
+- Result: +76 to +81 slots (+140 to 150 MiB, one point of hit rate), 23.2 to 23.6 t/s with and without. At
+  `reserve_mib=1000` the pool starts at 993 slots, grows to 1289, same speed. Nothing more to gain on this card under
+  Windows; the driver branch 581 is the last one for Pascal (the display card), newer drivers show no change to the budget in
+  their notes.
