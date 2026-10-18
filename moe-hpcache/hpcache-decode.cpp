@@ -151,6 +151,13 @@ hpcache_decoder::hpcache_decoder(const llama_moe_host * host, int n_threads, con
     }
 }
 
+// A CUDA device with its own memory. Under WSL the backend reports the card as an integrated GPU (type IGPU), with the
+// system memory as its free memory, so that type counts as well.
+static bool is_cuda_gpu(const llama_moe_device_info & info) {
+    return info.name != nullptr && strncmp(info.name, "CUDA", 4) == 0 &&
+            (info.type == GGML_BACKEND_DEVICE_TYPE_GPU || info.type == GGML_BACKEND_DEVICE_TYPE_IGPU);
+}
+
 // Read the expert tensors from the GGUF into one page-locked region. This runs as early as the provider is created,
 // before the backends touch a second GPU: a CUDA context on another card limits how much can be locked.
 void hpcache_decoder::init_arena() {
@@ -160,14 +167,19 @@ void hpcache_decoder::init_arena() {
     }
     int device_index = -1;
     int n_cuda = 0;
+    std::string seen;   // what the host passed, for the warning below
+    std::string pci;
     llama_moe_device_info devices[16];
     const int32_t n = host->get_devices(host->ctx, devices, 16);
     for (int32_t i = 0; i < n; ++i) {
-        if (devices[i].type == GGML_BACKEND_DEVICE_TYPE_GPU && devices[i].name != nullptr && strncmp(devices[i].name, "CUDA", 4) == 0) {
+        seen += std::string(i > 0 ? ", " : "") + (devices[i].name != nullptr ? devices[i].name : "?") + " (type " +
+                std::to_string((int) devices[i].type) + ")";
+        if (is_cuda_gpu(devices[i])) {
             ++n_cuda;
             if (device_index < 0) {
                 ggml_backend_dev_props props;
                 ggml_backend_dev_get_props(devices[i].dev, &props);
+                pci = props.device_id != nullptr ? props.device_id : "(none)";
                 device_index = hpcache_cuda_device_by_pci(props.device_id);
             }
         }
@@ -181,7 +193,9 @@ void hpcache_decoder::init_arena() {
                 "(pin_mib=N to change; CUDA_VISIBLE_DEVICES to the compute GPU allows all of it)");
     }
     if (device_index < 0) {
-        log(GGML_LOG_LEVEL_WARN, "arena: no CUDA device, the expert weights stay in the model mapping");
+        log(GGML_LOG_LEVEL_WARN, "arena: no CUDA device (" + std::to_string(n) + " devices from the host: " + seen +
+                (n_cuda > 0 ? "; CUDA PCI id " + pci + " has no CUDA index" : "") +
+                "), the expert weights stay in the model mapping");
         return;
     }
     hpcache_cuda_set_device(device_index);
@@ -534,15 +548,16 @@ void hpcache_decoder::init_pool(const llama_moe_layer_request & req) {
 
     llama_moe_device_info devices[16];
     const int32_t n = host->get_devices(host->ctx, devices, 16);
+    std::string seen;
     for (int32_t i = 0; i < n; ++i) {
-        if (devices[i].type == GGML_BACKEND_DEVICE_TYPE_GPU && devices[i].name != nullptr &&
-                strncmp(devices[i].name, "CUDA", 4) == 0) {
+        seen += std::string(i > 0 ? ", " : "") + (devices[i].name != nullptr ? devices[i].name : "?") + " (type " +
+                std::to_string((int) devices[i].type) + ")";
+        if (pool_dev == nullptr && is_cuda_gpu(devices[i])) {
             pool_dev = devices[i].dev;
-            break;
         }
     }
     if (pool_dev == nullptr) {
-        log(GGML_LOG_LEVEL_WARN, "GPU expert pool: no CUDA device");
+        log(GGML_LOG_LEVEL_WARN, "GPU expert pool: no CUDA device (" + std::to_string(n) + " devices from the host: " + seen + ")");
         return;
     }
 
@@ -556,7 +571,17 @@ void hpcache_decoder::init_pool(const llama_moe_layer_request & req) {
     }
 
     size_t free_bytes = 0, total_bytes = 0;
-    ggml_backend_dev_memory(pool_dev, &free_bytes, &total_bytes);
+    if (ggml_backend_dev_type(pool_dev) == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+        // the backend reports system memory for it: a card that only looks integrated (WSL) has NVML numbers,
+        // a device on shared memory has none, and a pool there would only copy experts within the same memory
+        if (!device_free_bytes(free_bytes, total_bytes)) {
+            log(GGML_LOG_LEVEL_WARN, "GPU expert pool: integrated GPU without NVML memory info, no pool");
+            pool_dev = nullptr;
+            return;
+        }
+    } else {
+        ggml_backend_dev_memory(pool_dev, &free_bytes, &total_bytes);
+    }
 
     size_t budget = free_bytes > opts.reserve_bytes ? free_bytes - opts.reserve_bytes : 0;
     if (opts.pool_bytes > 0) {
@@ -724,15 +749,16 @@ static bool nvml_used_bytes(const char * pci_bus_id, size_t & total, size_t & us
     return true;
 }
 
-void hpcache_decoder::device_free_bytes(size_t & free_bytes, size_t & total_bytes) const {
+bool hpcache_decoder::device_free_bytes(size_t & free_bytes, size_t & total_bytes) const {
     ggml_backend_dev_props props = {};
     ggml_backend_dev_get_props(pool_dev, &props);
     size_t used = 0;
     if (nvml_used_bytes(props.device_id, total_bytes, used)) {
         free_bytes = total_bytes > used ? total_bytes - used : 0;
-    } else {
-        ggml_backend_dev_memory(pool_dev, &free_bytes, &total_bytes);
+        return true;
     }
+    ggml_backend_dev_memory(pool_dev, &free_bytes, &total_bytes);
+    return false;
 }
 
 // The pool is built before the compute buffer of the decode graph exists, so it leaves a reserve for it. Once that

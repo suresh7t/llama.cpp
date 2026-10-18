@@ -86,7 +86,7 @@ private:
     void init_pool(const llama_moe_layer_request & req);
     void alloc_pool(layer & l, int il);
     void grow_pool();
-    void device_free_bytes(size_t & free_bytes, size_t & total_bytes) const;
+    bool device_free_bytes(size_t & free_bytes, size_t & total_bytes) const;   // true when read from NVML
     bool copy_slot(layer & l, int slot, int e);
     bool load_slot(layer & l, int slot, int e);
     void publish_pending();
