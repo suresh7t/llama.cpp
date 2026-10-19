@@ -51,6 +51,8 @@ struct hpcache_decoder::cpu_graph {
     ggml_tensor * w   = nullptr;
     ggml_tensor * out = nullptr;
 
+    ggml_tensor * in  = nullptr;   // second card: the block that x, ids and w are windows of
+
     ~cpu_graph() {
         if (buf != nullptr) {
             ggml_backend_buffer_free(buf);
@@ -60,6 +62,11 @@ struct hpcache_decoder::cpu_graph {
         }
     }
 };
+
+// input block of the second card: x, then the ids, then the weights, each part padded to 128 bytes
+static constexpr int gpu2_in_max_k = 32;   // 32 ids and 32 weights fill their 128 bytes
+static size_t gpu2_in_ids_off(int n_embd) { return (size_t(n_embd) * sizeof(float) + 127) & ~size_t(127); }
+static size_t gpu2_in_w_off(int n_embd)   { return gpu2_in_ids_off(n_embd) + 128; }
 
 struct hpcache_decoder::layer {
     // expert tensors that the graphs read, to notice a different model
@@ -92,6 +99,17 @@ struct hpcache_decoder::layer {
     int32_t *             h_table = nullptr;   // its pinned host mirror
     int                   table_index = -1;
 
+    // static pool on the second card: expert -> slot, never changes after the load
+    ggml_context *        g_ctx = nullptr;
+    ggml_backend_buffer_t g_buf = nullptr;
+    ggml_tensor *         g_gate    = nullptr;
+    ggml_tensor *         g_up      = nullptr;
+    ggml_tensor *         g_down    = nullptr;
+    ggml_tensor *         g_gate_up = nullptr;
+    int                   n_slots2 = 0;
+    std::vector<int32_t>  slot2_of;      // slot of each expert on the second card, -1 when not resident
+    std::vector<std::unique_ptr<cpu_graph>> graphs2;   // graphs on the second card by number of experts
+
     // staged experts: the stage kernel copies the GPU's share from the page-locked arena into these views
     hpcache_stage_args stage;
     ggml_context * a_ctx      = nullptr;
@@ -114,6 +132,12 @@ struct hpcache_decoder::layer {
         }
         if (a_ctx != nullptr) {
             ggml_free(a_ctx);
+        }
+        if (g_buf != nullptr) {
+            ggml_backend_buffer_free(g_buf);
+        }
+        if (g_ctx != nullptr) {
+            ggml_free(g_ctx);
         }
     }
 };
@@ -380,12 +404,51 @@ hpcache_decoder::~hpcache_decoder() {
                 (long long) n_hit.load(), (long long) n_routed.load(), 100.0 * n_hit.load() / n_routed.load(),
                 (long long) n_swapped, swap_us / 1000.0);
         log(GGML_LOG_LEVEL_INFO, buf);
+        if (db.block != nullptr && n_serve.load() > 0) {
+            // who waits for whom, per layer: the merge on the first card counts from the start of its wait
+            const double calls = double(n_serve.load());
+            const double period = double(decode_us.load()) / calls;
+            const double cpu_busy = double(serve_us.load()) / calls;
+            const double g2_busy = double(g2_set_us + g2_compute_us + g2_get_us + g2_graph_us) / calls;
+            const double w_cpu = double(db.stats[0]) / 1000.0 / calls;
+            char line[400];
+            if (db.two) {
+                const double w_two = double(db.stats[1]) / 1000.0 / calls;
+                const double n_last = double(db.stats[2] + db.stats[3]);
+                snprintf(line, sizeof(line),
+                        "waits per layer (us): first GPU waited %.0f for the CPU and %.0f for the second GPU (CPU last in %.0f%% of layers, second GPU in %.0f%%); "
+                        "CPU worker busy %.0f idle %.0f, second GPU worker busy %.0f idle %.0f, layer period %.0f",
+                        w_cpu, w_two, n_last > 0 ? 100.0 * db.stats[2] / n_last : 0.0, n_last > 0 ? 100.0 * db.stats[3] / n_last : 0.0,
+                        cpu_busy, period - cpu_busy, g2_busy, period - g2_busy, period);
+            } else {
+                snprintf(line, sizeof(line),
+                        "waits per layer (us): first GPU waited %.0f for the CPU; CPU worker busy %.0f idle %.0f, layer period %.0f",
+                        w_cpu, cpu_busy, period - cpu_busy, period);
+            }
+            log(GGML_LOG_LEVEL_INFO, line);
+        }
+        if (g2_n > 0) {
+            snprintf(buf, sizeof(buf), "second GPU worker: %lld layer calls (%lld empty), %.2f experts each; per call: graph lookup %.1f us, inputs %.1f us, compute %.1f us, result %.1f us",
+                    (long long) g2_n, (long long) g2_empty, double(g2_m) / g2_n, double(g2_graph_us) / g2_n,
+                    double(g2_set_us) / g2_n, double(g2_compute_us) / g2_n, double(g2_get_us) / g2_n);
+            log(GGML_LOG_LEVEL_INFO, buf);
+        }
+        if (n_gpu2.load() > 0) {
+            snprintf(buf, sizeof(buf), "second GPU: %lld of %lld routed experts served by its static pool (%.1f%%), together with the first pool %.1f%%",
+                    (long long) n_gpu2.load(), (long long) n_routed.load(), 100.0 * n_gpu2.load() / n_routed.load(),
+                    100.0 * (n_gpu2.load() + n_hit.load()) / n_routed.load());
+            log(GGML_LOG_LEVEL_INFO, buf);
+        }
     }
     quit.store(true);
     armed.store(false);
     follower_sig.notify();
+    follower2_sig.notify();
     if (thread.joinable()) {
         thread.join();
+    }
+    if (thread2.joinable()) {
+        thread2.join();
     }
 
     if (const char * path = getenv("HPCACHE_ROUTING_DUMP")) {
@@ -416,6 +479,15 @@ hpcache_decoder::~hpcache_decoder() {
     }
     hpcache_cuda_tables_free(tables);
     hpcache_doorbell_free(db);
+    hpcache_cuda_keepalive_stop(gpu2_keepalive);
+    if (gpu2_stage_buf != nullptr) {
+        ggml_backend_buffer_free(gpu2_stage_buf);
+    } else {
+        free(gpu2_stage);
+    }
+    if (gpu2_backend != nullptr) {
+        ggml_backend_free(gpu2_backend);
+    }
     if (cpu != nullptr) {
         ggml_backend_free(cpu);
     }
@@ -515,6 +587,55 @@ hpcache_decoder::cpu_graph * hpcache_decoder::cpu_graph_for(layer & l, int m) {
     return l.graphs[m].get();
 }
 
+// the same expert math on the second card, over its static pool; ids are slots of that pool
+hpcache_decoder::cpu_graph * hpcache_decoder::gpu2_graph_for(layer & l, int m) {
+    if (m < 1 || m > l.k || l.n_slots2 == 0) {
+        return nullptr;
+    }
+    if ((int) l.graphs2.size() <= l.k) {
+        l.graphs2.resize(l.k + 1);
+    }
+    if (l.graphs2[m]) {
+        return l.graphs2[m].get();
+    }
+
+    auto g = std::make_unique<cpu_graph>();
+    const size_t graph_size = 64 + 4 * size_t(m);
+    ggml_init_params params = {
+        /*.mem_size   =*/ ggml_tensor_overhead() * graph_size + ggml_graph_overhead_custom(graph_size, false),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    g->ctx = ggml_init(params);
+    if (g->ctx == nullptr) {
+        return nullptr;
+    }
+    ggml_context * ctx = g->ctx;
+
+    // x, ids and w are windows of the first tensor, so the one allocation below places all of them and one copy fills them
+    g->in  = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, gpu2_in_ids_off(l.n_embd) + gpu2_in_max_k * 8);
+    g->x   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, l.n_embd, 1, 1);
+    g->ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, m, 1);
+    g->w   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, m, 1);
+    g->x->view_src   = g->in;
+    g->x->view_offs  = 0;
+    g->ids->view_src  = g->in;
+    g->ids->view_offs = gpu2_in_ids_off(l.n_embd);
+    g->w->view_src    = g->in;
+    g->w->view_offs   = gpu2_in_w_off(l.n_embd);
+    g->out = build_experts(ctx, l.g_gate_up, l.g_gate, l.g_up, l.g_down, g->x, g->ids, g->w, l.n_embd, m, l.clamp);
+
+    g->gf = ggml_new_graph_custom(ctx, graph_size, false);
+    ggml_build_forward_expand(g->gf, g->out);
+
+    g->buf = ggml_backend_alloc_ctx_tensors(ctx, gpu2_backend);
+    if (g->buf == nullptr) {
+        return nullptr;
+    }
+    l.graphs2[m] = std::move(g);
+    return l.graphs2[m].get();
+}
+
 // a Strata expert profile: "STRP", five u32 (version, layers, experts, slots, pairs), then u16 pairs
 static bool read_profile(const std::string & path, std::vector<std::pair<int, int>> & ranked) {
     FILE * f = fopen(path.c_str(), "rb");
@@ -602,7 +723,8 @@ void hpcache_decoder::init_pool(const llama_moe_layer_request & req) {
     if (!opts.profile.empty() && !read_profile(opts.profile, profile)) {
         log(GGML_LOG_LEVEL_WARN, "GPU expert pool: cannot read profile " + opts.profile);
     }
-    pool_rank_limit = std::min<int64_t>(pool_slots, (int64_t) profile.size());
+    init_gpu2(slot_bytes, req.down_exps != nullptr && req.down_exps->data != nullptr);
+    pool_rank_limit = rank_base + std::min<int64_t>(pool_slots, (int64_t) profile.size() - rank_base);
 
     char buf[256];
     snprintf(buf, sizeof(buf), "GPU expert pool: %.0f MiB free of %.0f MiB, budget %.0f MiB, about %lld expert slots%s",
@@ -628,7 +750,8 @@ void hpcache_decoder::alloc_pool(layer & l, int il) {
         if (t->buffer == nullptr || !host_buffer || strstr(name, "REPACK") != nullptr ||
                 strstr(name, "AMX") != nullptr || t->data == nullptr) {
             log(GGML_LOG_LEVEL_WARN, "GPU expert pool: layer " + std::to_string(il) + " expert tensor " + t->name +
-                    " is in buffer type " + name + ", the layer stays on the CPU");
+                    " is in buffer type " + name + (t->data == nullptr ? " (no data pointer)" : "") +
+                    (host_buffer ? "" : " (not a host buffer)") + ", the layer stays on the CPU");
             return;
         }
         slot_bytes += t->nb[2];
@@ -636,7 +759,7 @@ void hpcache_decoder::alloc_pool(layer & l, int il) {
 
     int n_slots = 0;
     if (!profile.empty()) {
-        for (int64_t i = 0; i < pool_rank_limit; ++i) {
+        for (int64_t i = rank_base; i < pool_rank_limit; ++i) {
             n_slots += profile[i].first == il;
         }
     } else if (opts.n_layers > 0) {
@@ -697,7 +820,7 @@ void hpcache_decoder::alloc_pool(layer & l, int il) {
     const int n_seed = (opts.spare_slot && n_slots >= 2) ? n_slots - 1 : n_slots;
     l.spare = n_seed < n_slots ? n_slots - 1 : -1;
     int next = 0;
-    for (int64_t i = 0; i < pool_rank_limit && next < n_seed; ++i) {
+    for (int64_t i = rank_base; i < pool_rank_limit && next < n_seed; ++i) {
         if (profile[i].first != il || profile[i].second >= l.n_expert) {
             continue;
         }
@@ -749,16 +872,164 @@ static bool nvml_used_bytes(const char * pci_bus_id, size_t & total, size_t & us
     return true;
 }
 
-bool hpcache_decoder::device_free_bytes(size_t & free_bytes, size_t & total_bytes) const {
+bool hpcache_decoder::device_free_bytes(ggml_backend_dev_t dev, size_t & free_bytes, size_t & total_bytes) const {
     ggml_backend_dev_props props = {};
-    ggml_backend_dev_get_props(pool_dev, &props);
+    ggml_backend_dev_get_props(dev, &props);
     size_t used = 0;
     if (nvml_used_bytes(props.device_id, total_bytes, used)) {
         free_bytes = total_bytes > used ? total_bytes - used : 0;
         return true;
     }
-    ggml_backend_dev_memory(pool_dev, &free_bytes, &total_bytes);
+    ggml_backend_dev_memory(dev, &free_bytes, &total_bytes);
     return false;
+}
+
+bool hpcache_decoder::device_free_bytes(size_t & free_bytes, size_t & total_bytes) const {
+    return device_free_bytes(pool_dev, free_bytes, total_bytes);
+}
+
+// The second CUDA card holds a static pool: the top ranks of the profile, loaded once and never swapped, because its
+// link is a PCIe 3.0 x1 slot (about 0.55 GB/s, 2.3 ms for one expert). The pool of the first card then starts after
+// those ranks (rank_base), so no expert is in both.
+void hpcache_decoder::init_gpu2(size_t slot_bytes, bool real_model) {
+    rank_base = 0;
+    // the memory fit builds a first model without data: leave the second card alone then
+    if (!opts.gpu2 || !real_model) {
+        return;
+    }
+    if (profile.empty() || slot_bytes == 0) {
+        log(GGML_LOG_LEVEL_WARN, "second GPU: needs an expert profile to know which experts to keep, not used");
+        return;
+    }
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t d = ggml_backend_dev_get(i);
+        const char * name = ggml_backend_dev_name(d);
+        if (d == pool_dev || name == nullptr || strncmp(name, "CUDA", 4) != 0) {
+            continue;
+        }
+        if (!opts.gpu2_name.empty() && opts.gpu2_name != name) {
+            continue;
+        }
+        gpu2_dev = d;
+        break;
+    }
+    if (gpu2_dev == nullptr) {
+        log(GGML_LOG_LEVEL_WARN, "second GPU: no other CUDA device" +
+                (opts.gpu2_name.empty() ? std::string() : " named " + opts.gpu2_name) + ", not used");
+        return;
+    }
+    ggml_backend_dev_props props;
+    ggml_backend_dev_get_props(gpu2_dev, &props);
+    gpu2_index = hpcache_cuda_device_by_pci(props.device_id);
+    if (gpu2_index < 0) {
+        log(GGML_LOG_LEVEL_WARN, "second GPU: cannot map " + std::string(ggml_backend_dev_name(gpu2_dev)) + " to a CUDA index, not used");
+        gpu2_dev = nullptr;
+        return;
+    }
+    size_t free_bytes = 0, total_bytes = 0;
+    device_free_bytes(gpu2_dev, free_bytes, total_bytes);
+    gpu2_budget = free_bytes > opts.gpu2_reserve_bytes ? free_bytes - opts.gpu2_reserve_bytes : 0;
+    if (opts.gpu2_pool_bytes > 0) {
+        gpu2_budget = std::min(gpu2_budget, opts.gpu2_pool_bytes);
+    }
+    gpu2_slots = int64_t(gpu2_budget / slot_bytes);
+    rank_base = std::min<int64_t>(gpu2_slots, (int64_t) profile.size());
+    char buf[256];
+    snprintf(buf, sizeof(buf), "second GPU %s: %.0f MiB free of %.0f MiB, budget %.0f MiB, about %lld static expert slots",
+            ggml_backend_dev_name(gpu2_dev), free_bytes / 1048576.0, total_bytes / 1048576.0, gpu2_budget / 1048576.0,
+            (long long) gpu2_slots);
+    log(GGML_LOG_LEVEL_INFO, buf);
+    gpu2_backend = ggml_backend_dev_init(gpu2_dev, nullptr);
+    if (gpu2_backend == nullptr) {
+        log(GGML_LOG_LEVEL_WARN, "second GPU: cannot create the backend, not used");
+        gpu2_dev = nullptr;
+        rank_base = 0;
+        gpu2_slots = 0;
+    }
+    hpcache_cuda_set_device(pool_device_index);   // the memory query above switched to the second card
+}
+
+// fill the static pool of one layer with its experts among the first rank_base ranks of the profile
+void hpcache_decoder::alloc_gpu2(layer & l, int il) {
+    if (gpu2_dev == nullptr || rank_base == 0) {
+        return;
+    }
+    if (l.d_table == nullptr) {
+        // the table of the first pool carries the marks that keep the other paths off these experts
+        log(GGML_LOG_LEVEL_WARN, "second GPU: layer " + std::to_string(il) + " has no pool on the first card, nothing placed");
+        return;
+    }
+    ggml_tensor * src[4] = { l.t_gate, l.t_up, l.t_down, l.t_gate_up };
+    size_t slot_bytes = 0;
+    for (ggml_tensor * t : src) {
+        if (t == nullptr) {
+            continue;
+        }
+        // the copy needs the original row layout, as for the first pool
+        const char * name = t->buffer != nullptr ? ggml_backend_buft_name(ggml_backend_buffer_get_type(t->buffer)) : "";
+        const bool host_buffer = (t->buffer != nullptr && ggml_backend_buffer_is_host(t->buffer)) || strcmp(name, "CUDA_Host") == 0;
+        if (!host_buffer || strstr(name, "REPACK") != nullptr || strstr(name, "AMX") != nullptr || t->data == nullptr) {
+            return;
+        }
+        slot_bytes += t->nb[2];
+    }
+
+    std::vector<int> experts;
+    for (int64_t i = 0; i < rank_base; ++i) {
+        if (profile[i].first == il && profile[i].second < l.n_expert) {
+            experts.push_back(profile[i].second);
+        }
+    }
+    if (gpu2_used + experts.size() * slot_bytes > gpu2_budget) {
+        experts.resize((gpu2_budget - gpu2_used) / slot_bytes);
+    }
+    if (experts.empty()) {
+        return;
+    }
+
+    const int64_t t0 = adm_now();
+    hpcache_cuda_set_device(gpu2_index);
+    struct device_guard {
+        int back;
+        ~device_guard() { if (back >= 0) hpcache_cuda_set_device(back); }
+    } guard = { pool_device_index };
+    ggml_init_params params = { ggml_tensor_overhead() * 8, nullptr, true };
+    l.g_ctx = ggml_init(params);
+    if (l.g_ctx == nullptr) {
+        return;
+    }
+    const int n = (int) experts.size();
+    ggml_tensor ** dst[4] = { &l.g_gate, &l.g_up, &l.g_down, &l.g_gate_up };
+    for (int i = 0; i < 4; ++i) {
+        if (src[i] != nullptr) {
+            *dst[i] = ggml_new_tensor_3d(l.g_ctx, src[i]->type, src[i]->ne[0], src[i]->ne[1], n);
+        }
+    }
+    l.g_buf = ggml_backend_alloc_ctx_tensors_from_buft(l.g_ctx, ggml_backend_dev_buffer_type(gpu2_dev));
+    if (l.g_buf == nullptr) {
+        log(GGML_LOG_LEVEL_WARN, "second GPU: allocation failed at layer " + std::to_string(il) + ", the card is full");
+        ggml_free(l.g_ctx);
+        l.g_ctx = nullptr;
+        l.g_gate = l.g_up = l.g_down = l.g_gate_up = nullptr;
+        gpu2_budget = gpu2_used;
+        return;
+    }
+    l.slot2_of.assign(l.n_expert, -1);
+    for (int s = 0; s < n; ++s) {
+        const int e = experts[s];
+        for (int t = 0; t < 4; ++t) {
+            if (src[t] != nullptr) {
+                const size_t nb = src[t]->nb[2];
+                ggml_backend_tensor_set(*dst[t], (const char *) src[t]->data + size_t(e) * nb, size_t(s) * nb, nb);
+            }
+        }
+        l.slot2_of[e] = s;
+    }
+    l.n_slots2 = n;
+    gpu2_used += size_t(n) * slot_bytes;
+    gpu2_placed += n;
+    ++gpu2_layers;
+    gpu2_load_us += adm_now() - t0;
 }
 
 // The pool is built before the compute buffer of the decode graph exists, so it leaves a reserve for it. Once that
@@ -776,6 +1047,15 @@ void hpcache_decoder::grow_pool() {
         return;   // no pool yet (a warm-up decode before the graph with the pool), try again at the next decode
     }
     pool_grown = true;
+    if (gpu2_dev != nullptr && !gpu2_logged) {
+        gpu2_logged = true;
+        size_t free_bytes = 0, total_bytes = 0;
+        device_free_bytes(gpu2_dev, free_bytes, total_bytes);
+        char msg[256];
+        snprintf(msg, sizeof(msg), "second GPU pool: %lld static slots in %d layers (%.0f MiB), loaded in %.1f s, %.0f MiB free on the card",
+                (long long) gpu2_placed, gpu2_layers, gpu2_used / 1048576.0, gpu2_load_us / 1e6, free_bytes / 1048576.0);
+        log(GGML_LOG_LEVEL_INFO, msg);
+    }
     if (!opts.grow || profile.empty()) {
         return;
     }
@@ -928,6 +1208,12 @@ void hpcache_decoder::stage_table(layer & l) {
         return;
     }
     memcpy(l.h_table, l.slot_of.data(), size_t(l.n_expert) * sizeof(int32_t));
+    // -1: not on a GPU, -2: on the second card (neither the pool nor the PCIe path computes it)
+    for (int e = 0; e < (int) l.slot2_of.size(); ++e) {
+        if (l.slot2_of[e] >= 0) {
+            l.h_table[e] = -2;
+        }
+    }
     tables_dirty_upto = std::max(tables_dirty_upto, l.table_index + 1);
 }
 
@@ -1209,6 +1495,11 @@ std::unique_ptr<hpcache_decoder::layer> hpcache_decoder::make_layer(const llama_
         }
     }
     alloc_pool(*l, req.il);
+    alloc_gpu2(*l, req.il);
+    if (l->n_slots2 > 0) {
+        stage_table(*l);
+        flush_tables();
+    }
     return l;
 }
 
@@ -1237,7 +1528,7 @@ ggml_tensor * hpcache_decoder::build_layer(const llama_moe_layer_request & req) 
 
     layer * l = nullptr;
     {
-        std::lock_guard<std::mutex> lock(layers_mutex);
+        hpcache_sync::spin_guard lock(layers_lock);
         auto it = layers.find(req.il);
         if (it != layers.end() && (it->second->t_up != req.up_exps || it->second->t_gate != req.gate_exps ||
                 it->second->t_down != req.down_exps || it->second->t_gate_up != req.gate_up_exps)) {
@@ -1409,7 +1700,7 @@ void hpcache_decoder::serve(uint32_t seq) {
 
     layer * l = nullptr;
     {
-        std::lock_guard<std::mutex> lock(layers_mutex);
+        hpcache_sync::spin_guard lock(layers_lock);
         const auto it = layers.find(il);
         if (it != layers.end()) {
             l = it->second.get();
@@ -1458,9 +1749,14 @@ void hpcache_decoder::serve(uint32_t seq) {
         int32_t ids[32];
         float   w[32];
         int     m = 0;
+        int     n2 = 0;   // routed to the second card
         for (int i = 0; i < db.k; ++i) {
             const int32_t e = db.ids[i];
             if (e < 0 || e >= l->n_expert) {
+                continue;
+            }
+            if (!l->slot2_of.empty() && l->slot2_of[e] >= 0) {
+                ++n2;
                 continue;
             }
             if (l->n_slots > 0) {
@@ -1474,7 +1770,8 @@ void hpcache_decoder::serve(uint32_t seq) {
             ++m;
         }
         n_routed += db.k;
-        n_hit    += db.k - m;
+        n_hit    += db.k - m - n2;
+        n_gpu2   += n2;
         if (l->pcie && m > 0) {
             // the GPU takes the last g misses in routing order (pcie_select_kernel), the CPU the first m - g
             int g = (m * int(*db.frac)) >> 8;
@@ -1574,6 +1871,160 @@ void hpcache_decoder::follower() {
     }
 }
 
+// Everything the worker of the second card would otherwise create while a token is running: the pinned staging block, the
+// graph of every layer for every number of experts, and the lazy load of the kernels that those graphs run. A CUDA
+// allocation or module load takes locks of the runtime, and one that waits behind a launch of the graph thread, while the
+// first card's wait kernel spins for the worker's answer, ends in a deadlock. Runs on the graph thread before the worker
+// exists.
+void hpcache_decoder::warm_gpu2() {
+    gpu2_warm = true;
+    const int64_t t0 = adm_now();
+    const int dev = hpcache_cuda_get_device();
+
+    const size_t bytes = gpu2_in_w_off(db.n_embd) + 128;
+    ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(gpu2_dev);
+    if (host_buft != nullptr) {
+        gpu2_stage_buf = ggml_backend_buft_alloc_buffer(host_buft, bytes);
+    }
+    gpu2_stage = gpu2_stage_buf != nullptr ? (char *) ggml_backend_buffer_get_base(gpu2_stage_buf) : (char *) malloc(bytes);
+    memset(gpu2_stage, 0, bytes);   // x = 0, slot 0 and weight 0 for every expert: a valid call that computes zeros
+
+    std::vector<float> y(db.n_embd);
+    int n_graphs = 0;
+    for (auto & kv : layers) {
+        layer & l = *kv.second;
+        if (l.n_slots2 == 0) {
+            continue;
+        }
+        for (int m = 1; m <= l.k && m <= gpu2_in_max_k; ++m) {
+            cpu_graph * g = gpu2_graph_for(l, m);
+            if (g == nullptr) {
+                continue;
+            }
+            ggml_backend_tensor_set_async(gpu2_backend, g->in, gpu2_stage, 0, gpu2_in_w_off(db.n_embd) + size_t(m) * sizeof(float));
+            ggml_backend_graph_compute(gpu2_backend, g->gf);
+            ggml_backend_tensor_get(g->out, y.data(), 0, y.size() * sizeof(float));
+            ++n_graphs;
+        }
+    }
+    if (dev >= 0) {
+        hpcache_cuda_set_device(dev);
+    }
+    log(GGML_LOG_LEVEL_INFO, "second GPU: " + std::to_string(n_graphs) + " graphs built and run once in " +
+            std::to_string((adm_now() - t0) / 1000) + " ms");
+}
+
+// The worker of the second card answers every ring: the experts of the layer that live there run on that card, the
+// result goes to pinned memory, and the flag tells the merge on the first card that it can read it. A layer without
+// experts there answers with zeros.
+void hpcache_decoder::serve2(uint32_t seq) {
+    const int il = *db.layer;
+    layer * l = nullptr;
+    {
+        hpcache_sync::spin_guard lock(layers_lock);
+        const auto it = layers.find(il);
+        if (it != layers.end()) {
+            l = it->second.get();
+        }
+    }
+
+    if (gpu2_stage == nullptr) {
+        const size_t bytes = gpu2_in_w_off(db.n_embd) + 128;
+        ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(gpu2_dev);
+        if (host_buft != nullptr) {
+            gpu2_stage_buf = ggml_backend_buft_alloc_buffer(host_buft, bytes);
+        }
+        gpu2_stage = gpu2_stage_buf != nullptr ? (char *) ggml_backend_buffer_get_base(gpu2_stage_buf) : (char *) malloc(bytes);
+    }
+    int32_t * ids = (int32_t *) (gpu2_stage + gpu2_in_ids_off(db.n_embd));
+    float *   w   = (float *)   (gpu2_stage + gpu2_in_w_off(db.n_embd));
+    int       m   = 0;
+    if (l != nullptr && l->n_slots2 > 0) {
+        for (int i = 0; i < db.k && m < gpu2_in_max_k; ++i) {
+            const int32_t e = db.ids[i];
+            if (e >= 0 && e < l->n_expert && l->slot2_of[e] >= 0) {
+                ids[m] = l->slot2_of[e];
+                w[m]   = db.w[i];
+                ++m;
+            }
+        }
+    }
+    if (m > 0) {
+        memcpy(gpu2_stage, db.x, size_t(db.n_embd) * sizeof(float));
+        const int64_t t0 = adm_now();
+        cpu_graph * g = gpu2_graph_for(*l, m);
+        if (g == nullptr) {
+            GGML_ABORT("moe-hpcache: no graph on the second GPU for layer %d with %d experts", il, m);
+        }
+        const int64_t t1 = adm_now();
+        // queued on the stream of the card, the result read below waits for all of them
+        ggml_backend_tensor_set_async(gpu2_backend, g->in, gpu2_stage, 0, gpu2_in_w_off(db.n_embd) + size_t(m) * sizeof(float));
+        const int64_t t2 = adm_now();
+        ggml_backend_graph_compute(gpu2_backend, g->gf);
+        const int64_t t3 = adm_now();
+        ggml_backend_tensor_get(g->out, db.y2, 0, size_t(db.n_embd) * sizeof(float));
+        const int64_t t4 = adm_now();
+        g2_n++; g2_m += m; g2_graph_us += t1 - t0; g2_set_us += t2 - t1; g2_compute_us += t3 - t2; g2_get_us += t4 - t3;
+    } else {
+        g2_empty++;
+        memset(db.y2, 0, size_t(db.n_embd) * sizeof(float));
+    }
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    *db.flag2 = seq;
+}
+
+// The worker of the second card waits on the answer of every layer, so it gets a core of its own: the last one that the
+// process may use. Its priority stays normal: a spinning thread of higher priority starves the graph thread that has to
+// publish the next layer when that one is scheduled on the same core. Returns the core, or -1.
+static int pin_worker_thread() {
+#ifdef _WIN32
+    DWORD_PTR process_mask = 0, system_mask = 0;
+    if (!GetProcessAffinityMask(GetCurrentProcess(), &process_mask, &system_mask) || process_mask == 0) {
+        return -1;
+    }
+    int core = 63;
+    while (core > 0 && !(process_mask & (DWORD_PTR(1) << core))) {
+        --core;
+    }
+    if (SetThreadAffinityMask(GetCurrentThread(), DWORD_PTR(1) << core) == 0) {
+        return -1;
+    }
+    return core;
+#else
+    return -1;
+#endif
+}
+
+void hpcache_decoder::follower2() {
+    uint32_t seen = 0;
+
+    // off by default: the CPU pool threads spin on cores that the process mask does not tell apart, and a worker that
+    // shares its core with one of them waits for a scheduler slice at every layer
+    const int core = getenv("HPCACHE_G2_PIN") != nullptr ? pin_worker_thread() : -1;
+    log(GGML_LOG_LEVEL_INFO, core >= 0 ? "second GPU worker: pinned to core " + std::to_string(core)
+                                       : "second GPU worker: not pinned");
+
+    for (;;) {
+        follower2_sig.wait_until([&] { return armed.load() || quit.load(); });
+        if (quit.load()) {
+            return;
+        }
+
+        while (armed.load(std::memory_order_acquire)) {
+            const uint32_t seq = *db.seq;
+            if (seq != seen) {
+                serve2(seq);
+                seen = seq;
+                continue;
+            }
+            HPCACHE_PAUSE();
+        }
+
+        idle2.store(true);
+        follower2_sig.notify();
+    }
+}
+
 // called by the thread that runs the graph, never concurrently with end()
 void hpcache_decoder::arm() {
     if (armed.load(std::memory_order_acquire)) {
@@ -1583,8 +2034,25 @@ void hpcache_decoder::arm() {
         thread = std::thread([this] { follower(); });
     }
     idle.store(false);
+    db.two = gpu2_active();
+    if (db.two) {
+        if (!gpu2_warm) {
+            warm_gpu2();
+        }
+        if (!thread2.joinable()) {
+            thread2 = std::thread([this] { follower2(); });
+        }
+        idle2.store(false);
+        if (gpu2_keepalive == nullptr && opts.gpu2_keepalive) {
+            gpu2_keepalive = hpcache_cuda_keepalive_start(gpu2_index);
+            log(GGML_LOG_LEVEL_INFO, "second GPU: keep-alive kernel running");
+        }
+    }
     armed.store(true, std::memory_order_release);
     follower_sig.notify();
+    if (db.two) {
+        follower2_sig.notify();
+    }
 }
 
 void hpcache_decoder::begin(const llama_moe_decode_info & info) {
@@ -1775,6 +2243,10 @@ void hpcache_decoder::end() {
     armed.store(false, std::memory_order_release);
     follower_sig.notify();
     follower_sig.wait_until([&] { return idle.load(); });
+    if (db.two) {
+        follower2_sig.notify();
+        follower2_sig.wait_until([&] { return idle2.load(); });
+    }
 
     if (cpu_pool) {
         cpu_pool->set_active(false);

@@ -2,20 +2,25 @@
 
 #include <cuda_runtime.h>
 
+#include <atomic>
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <thread>
 
 static size_t round_up(size_t n) {
     return (n + 255) & ~size_t(255);
 }
 
 bool hpcache_doorbell_init(hpcache_doorbell & db, int n_embd, int k, std::string & error) {
-    // one cache line each for the three counters, then the arrays
-    const size_t off_x   = 256;
+    // one cache line each for the counters, then the arrays
+    const size_t off_x   = 384;
     const size_t off_ids = off_x   + round_up(size_t(n_embd) * sizeof(float));
     const size_t off_w   = off_ids + round_up(size_t(k) * sizeof(int32_t));
     const size_t off_y   = off_w   + round_up(size_t(k) * sizeof(float));
-    const size_t total   = off_y   + round_up(size_t(n_embd) * sizeof(float));
+    const size_t off_y2  = off_y   + round_up(size_t(n_embd) * sizeof(float));
+    const size_t total   = off_y2  + round_up(size_t(n_embd) * sizeof(float));
 
     void * host = nullptr;
     if (cudaHostAlloc(&host, total, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
@@ -45,20 +50,26 @@ bool hpcache_doorbell_init(hpcache_doorbell & db, int n_embd, int k, std::string
     db.layer = reinterpret_cast<volatile int32_t  *>(h + 128);
     db.frac  = reinterpret_cast<volatile int32_t  *>(h + 192);
     db.wait_ns = reinterpret_cast<volatile unsigned long long *>(h + 200);
+    db.flag2 = reinterpret_cast<volatile uint32_t *>(h + 256);
+    db.stats = reinterpret_cast<volatile unsigned long long *>(h + 320);
     db.x     = reinterpret_cast<float   *>(h + off_x);
     db.ids   = reinterpret_cast<int32_t *>(h + off_ids);
     db.w     = reinterpret_cast<float   *>(h + off_w);
     db.y     = reinterpret_cast<float   *>(h + off_y);
+    db.y2    = reinterpret_cast<float   *>(h + off_y2);
 
     db.d_seq   = reinterpret_cast<volatile uint32_t *>(d + 0);
     db.d_flag  = reinterpret_cast<volatile uint32_t *>(d + 64);
     db.d_layer = reinterpret_cast<volatile int32_t  *>(d + 128);
     db.d_frac  = reinterpret_cast<volatile int32_t  *>(d + 192);
     db.d_wait_ns = reinterpret_cast<volatile unsigned long long *>(d + 200);
+    db.d_flag2 = reinterpret_cast<volatile uint32_t *>(d + 256);
+    db.d_stats = reinterpret_cast<volatile unsigned long long *>(d + 320);
     db.d_x     = reinterpret_cast<float   *>(d + off_x);
     db.d_ids   = reinterpret_cast<int32_t *>(d + off_ids);
     db.d_w     = reinterpret_cast<float   *>(d + off_w);
     db.d_y     = reinterpret_cast<float   *>(d + off_y);
+    db.d_y2    = reinterpret_cast<float   *>(d + off_y2);
     return true;
 }
 
@@ -96,12 +107,24 @@ static __device__ __forceinline__ unsigned long long global_ns() {
 }
 
 static __global__ void wait_merge_kernel(const volatile uint32_t * flag, const volatile uint32_t * seq,
-        const volatile float * y, float * dst, int n, volatile unsigned long long * wait_ns) {
+        const volatile float * y, float * dst, int n, volatile unsigned long long * wait_ns,
+        const volatile uint32_t * flag2, const volatile float * y2, volatile unsigned long long * stats) {
     __shared__ uint32_t want;
     if (threadIdx.x == 0) {
         want = *seq;
         const unsigned long long t0 = global_ns();
-        while (*flag != want) {
+        // both answers are polled together, so each wait is counted from the same start
+        unsigned long long t_cpu = 0, t_two = 0;
+        bool cpu_done = false, two_done = flag2 == nullptr;
+        while (!cpu_done || !two_done) {
+            if (!cpu_done && *flag == want) {
+                cpu_done = true;
+                t_cpu = global_ns() - t0;
+            }
+            if (!two_done && *flag2 == want) {
+                two_done = true;
+                t_two = global_ns() - t0;
+            }
 #if __CUDA_ARCH__ >= 700
             __nanosleep(100);
 #endif
@@ -109,10 +132,19 @@ static __global__ void wait_merge_kernel(const volatile uint32_t * flag, const v
         __threadfence_system();
         // one wait kernel runs at a time, so a plain add is enough
         *wait_ns = *wait_ns + (global_ns() - t0);
+        stats[0] = stats[0] + t_cpu;
+        if (flag2 != nullptr) {
+            stats[1] = stats[1] + t_two;
+            if (t_cpu >= t_two) {
+                stats[2] = stats[2] + 1;
+            } else {
+                stats[3] = stats[3] + 1;
+            }
+        }
     }
     __syncthreads();
     for (int i = threadIdx.x; i < n; i += blockDim.x) {
-        dst[i] = y[i];
+        dst[i] = y2 != nullptr ? y[i] + y2[i] : y[i];
     }
 }
 
@@ -144,7 +176,8 @@ void hpcache_cuda_publish(void * stream, const hpcache_doorbell & db,
 }
 
 void hpcache_cuda_wait_merge(void * stream, const hpcache_doorbell & db, float * dst) {
-    wait_merge_kernel<<<1, 256, 0, (cudaStream_t) stream>>>(db.d_flag, db.d_seq, db.d_y, dst, db.n_embd, db.d_wait_ns);
+    wait_merge_kernel<<<1, 256, 0, (cudaStream_t) stream>>>(db.d_flag, db.d_seq, db.d_y, dst, db.n_embd, db.d_wait_ns,
+            db.two ? db.d_flag2 : nullptr, db.two ? db.d_y2 : nullptr, db.d_stats);
     const cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "moe-hpcache: wait kernel launch failed: %s\n", cudaGetErrorString(err));
@@ -164,6 +197,69 @@ void hpcache_cuda_set_device(int device) {
 
 void hpcache_cuda_sync_device() {
     cudaDeviceSynchronize();
+}
+
+// One warp that spins on the GPU's own clock. It is short because WDDM resets a kernel that runs for seconds; the thread
+// below always keeps the next one queued behind the running one. Other shapes were measured and are worse: kernels of 55 us
+// with a sync after each flood the launch path (3.5 t/s), and a single thread that waits on memory costs as much as this one.
+static __global__ void keepalive_kernel(unsigned long long ns) {
+    const unsigned long long t0 = global_ns();
+    while (global_ns() - t0 < ns) {
+    }
+}
+
+struct hpcache_keepalive {
+    std::thread       thread;
+    std::atomic<bool> stop{false};
+};
+
+void * hpcache_cuda_keepalive_start(int device) {
+    hpcache_keepalive * ka = new hpcache_keepalive();
+    ka->thread = std::thread([ka, device] {
+        constexpr unsigned long long kernel_ns = 40ull * 1000 * 1000;
+        cudaSetDevice(device);
+        cudaStream_t s = nullptr;
+        cudaEvent_t  done[2] = {};
+        int least = 0, greatest = 0;
+        cudaDeviceGetStreamPriorityRange(&least, &greatest);   // the least urgent one: the work of the card goes first
+        if (cudaStreamCreateWithPriority(&s, cudaStreamNonBlocking, least) != cudaSuccess ||
+            cudaEventCreateWithFlags(&done[0], cudaEventDisableTiming) != cudaSuccess ||
+            cudaEventCreateWithFlags(&done[1], cudaEventDisableTiming) != cudaSuccess) {
+            cudaGetLastError();
+            return;
+        }
+        // two in flight: when the older one is done the newer one is running, so the card is never without work
+        for (int i = 0; i < 2; ++i) {
+            keepalive_kernel<<<1, 32, 0, s>>>(kernel_ns);
+            cudaEventRecord(done[i], s);
+        }
+        int oldest = 0;
+        while (!ka->stop.load(std::memory_order_acquire)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            if (cudaEventQuery(done[oldest]) == cudaSuccess) {
+                keepalive_kernel<<<1, 32, 0, s>>>(kernel_ns);
+                cudaEventRecord(done[oldest], s);
+                oldest ^= 1;
+            }
+        }
+        cudaStreamSynchronize(s);
+        cudaEventDestroy(done[0]);
+        cudaEventDestroy(done[1]);
+        cudaStreamDestroy(s);
+    });
+    return ka;
+}
+
+void hpcache_cuda_keepalive_stop(void * handle) {
+    hpcache_keepalive * ka = static_cast<hpcache_keepalive *>(handle);
+    if (ka == nullptr) {
+        return;
+    }
+    ka->stop.store(true, std::memory_order_release);
+    if (ka->thread.joinable()) {
+        ka->thread.join();
+    }
+    delete ka;
 }
 
 int32_t * hpcache_cuda_table_alloc(int n_expert) {
@@ -307,7 +403,7 @@ static __global__ void pcie_select_kernel(const int32_t * ids, const float * w, 
         if (e < 0 || e >= n_expert) {
             continue;
         }
-        if (table == nullptr || table[e] < 0) {
+        if (table == nullptr || table[e] == -1) {
             miss[n++] = i;
         }
     }
@@ -366,7 +462,7 @@ static __global__ void pcie_stage_kernel(const int32_t * ids, const int32_t * ta
             if (e < 0 || e >= n_expert) {
                 continue;
             }
-            if (table == nullptr || table[e] < 0) {
+            if (table == nullptr || table[e] == -1) {
                 miss[n++] = i;
             }
         }

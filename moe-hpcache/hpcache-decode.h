@@ -38,6 +38,11 @@ struct hpcache_pool_options {
     bool        spare_slot    = false;             // one unmapped slot per layer receives the copy, the victim stays mapped until it lands
     bool        grow          = true;              // at the first decode, add slots from the device memory that is still free
     size_t      grow_margin_bytes = size_t(150) << 20;   // left free after growing
+    bool        gpu2          = false;             // a second CUDA card holds a static pool of the top-ranked experts
+    std::string gpu2_name;                         // device name such as CUDA1, empty: the first CUDA card besides the pool's
+    size_t      gpu2_pool_bytes    = 0;            // cap of that pool, 0 = free memory minus the reserve
+    size_t      gpu2_reserve_bytes = size_t(800) << 20;   // left free on it for the display, the driver and scratch
+    bool        gpu2_keepalive     = true;         // run a spinner on it so the driver keeps its clocks up, see hpcache_cuda_keepalive_start
 };
 
 // Single-token decode of the routed experts through a doorbell: the GPU publishes the router
@@ -86,7 +91,15 @@ private:
     void init_pool(const llama_moe_layer_request & req);
     void alloc_pool(layer & l, int il);
     void grow_pool();
+    void init_gpu2(size_t slot_bytes, bool real_model);
+    void alloc_gpu2(layer & l, int il);
+    bool gpu2_active() const { return gpu2_backend != nullptr && gpu2_placed > 0; }
+    cpu_graph * gpu2_graph_for(layer & l, int m);
+    void follower2();
+    void serve2(uint32_t seq);
+    void warm_gpu2();
     bool device_free_bytes(size_t & free_bytes, size_t & total_bytes) const;   // true when read from NVML
+    bool device_free_bytes(ggml_backend_dev_t dev, size_t & free_bytes, size_t & total_bytes) const;
     bool copy_slot(layer & l, int slot, int e);
     bool load_slot(layer & l, int slot, int e);
     void publish_pending();
@@ -132,7 +145,29 @@ private:
     size_t   pool_budget = 0;
     size_t   pool_used = 0;
     int64_t  pool_slots = 0;
-    int64_t  pool_rank_limit = 0;                 // profile pairs that fit the budget
+    int64_t  pool_rank_limit = 0;                 // end of the profile ranks that the pool takes (first rank: rank_base)
+    int64_t  rank_base = 0;                       // profile ranks before this one live on the second card
+
+    // second CUDA card: static pool, filled once
+    ggml_backend_dev_t gpu2_dev = nullptr;
+    int      gpu2_index = -1;
+    size_t   gpu2_budget = 0;
+    size_t   gpu2_used = 0;
+    int64_t  gpu2_slots = 0;                      // slots that fit the budget
+    int64_t  gpu2_placed = 0;                     // slots filled so far
+    int      gpu2_layers = 0;
+    int64_t  gpu2_load_us = 0;
+    bool     gpu2_logged = false;
+    ggml_backend_t gpu2_backend = nullptr;
+    ggml_backend_buffer_t gpu2_stage_buf = nullptr;   // page-locked copy of the input block, the source of its one upload
+    char *   gpu2_stage = nullptr;
+    bool     gpu2_warm = false;                   // the graphs and the staging block of the second card exist, see warm_gpu2
+    void *   gpu2_keepalive = nullptr;            // spinner that holds the clocks of the second card up
+    std::atomic<int64_t> n_gpu2{0};               // routed experts served by the second card
+    std::thread          thread2;                 // worker of the second card, answers each ring like the follower
+    hpcache_sync::signal follower2_sig;
+    std::atomic<bool>    idle2{true};
+    int64_t  g2_n = 0, g2_empty = 0, g2_m = 0, g2_graph_us = 0, g2_set_us = 0, g2_compute_us = 0, g2_get_us = 0;   // worker timing
     std::vector<std::pair<int, int>> profile;     // (layer, expert), ranked
     std::unique_ptr<hpcache_arena> arena;
     bool     arena_checked = false;
@@ -172,7 +207,7 @@ private:
 
     hpcache_doorbell db;
 
-    std::mutex layers_mutex;
+    hpcache_sync::spinlock layers_lock;
     std::map<int, std::unique_ptr<layer>> layers;
     std::deque<op_ctx> op_ctxs;
 

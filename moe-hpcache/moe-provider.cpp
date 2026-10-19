@@ -447,6 +447,22 @@ extern "C" MOE_HPCACHE_EXPORT const llama_moe_provider_api * llama_moe_provider_
         if (!param("grow_margin_mib").empty()) {
             pool.grow_margin_bytes = size_t(atoll(param("grow_margin_mib").c_str())) << 20;
         }
+        // gpu2=1: the first other CUDA card, gpu2=CUDA1: that device; gpu2_mib caps its pool
+        if (!param("gpu2").empty() && param("gpu2") != "0") {
+            pool.gpu2 = true;
+            if (param("gpu2") != "1") {
+                pool.gpu2_name = param("gpu2");
+            }
+        }
+        if (!param("gpu2_mib").empty()) {
+            pool.gpu2_pool_bytes = size_t(atoll(param("gpu2_mib").c_str())) << 20;
+        }
+        if (!param("gpu2_reserve_mib").empty()) {
+            pool.gpu2_reserve_bytes = size_t(atoll(param("gpu2_reserve_mib").c_str())) << 20;
+        }
+        if (!param("gpu2_keepalive").empty()) {
+            pool.gpu2_keepalive = atoi(param("gpu2_keepalive").c_str()) != 0;
+        }
         if (param("kernel") == "ggml") {
             pool.cpu_kernel = false;
         }
@@ -483,6 +499,9 @@ extern "C" MOE_HPCACHE_EXPORT const llama_moe_provider_api * llama_moe_provider_
         }
         if (!param("pcie_max").empty()) {
             pool.pcie_max = atoi(param("pcie_max").c_str());
+        } else if (pool.gpu2) {
+            // with a second card the CPU has room for what the first card streams: 2 experts per layer decode 3.5% faster than 3
+            pool.pcie_max = 2;
         }
         if (!param("pcie_frac").empty()) {
             pool.pcie_frac = float(atof(param("pcie_frac").c_str()));
@@ -510,8 +529,8 @@ extern "C" MOE_HPCACHE_EXPORT const llama_moe_provider_api * llama_moe_provider_
             pool.n_layers = atoi(param("moe_layers").c_str());
         }
         if (param("pin").empty() || atoi(param("pin").c_str()) != 0) {
-            // the CPU threads, the host thread of the graph and the driver
-            const std::string result = pin_process(param("cpus"), n_threads + 2);
+            // the CPU threads, the host thread of the graph and the driver, and the worker of the second card
+            const std::string result = pin_process(param("cpus"), n_threads + 2 + (pool.gpu2 ? 1 : 0));
             if (!result.empty()) {
                 provider->log(GGML_LOG_LEVEL_INFO, "CPU affinity: " + result);
             }
