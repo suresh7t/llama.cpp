@@ -19,6 +19,13 @@ struct hpcache_doorbell {
     volatile uint32_t * flag  = nullptr;   // set by the host to the seq it served
     volatile int32_t *  frac  = nullptr;   // GPU share of the missed experts, 0..256, written by the host between steps
     volatile unsigned long long * wait_ns = nullptr;   // total time the GPU waited for the follower, written by the GPU
+    // second card: its worker answers each ring with its own flag and result, written by the worker only
+    volatile uint32_t * flag2 = nullptr;   // set by the second card's worker to the seq it served
+    float *             y2    = nullptr;   // result of the experts on the second card, [n_embd]
+    bool                two   = false;     // the merge waits for flag2 as well
+    // written by the merge kernel on the GPU: [0] ns until the CPU answer was seen, [1] ns until the second card's, summed over
+    // layers (both counted from the start of the wait), [2] layers where the CPU answered last, [3] where the second card did
+    volatile unsigned long long * stats = nullptr;
 
     // the same memory, as the device sees it
     float *             d_x     = nullptr;
@@ -30,6 +37,9 @@ struct hpcache_doorbell {
     volatile uint32_t * d_flag  = nullptr;
     volatile int32_t *  d_frac  = nullptr;
     volatile unsigned long long * d_wait_ns = nullptr;
+    volatile uint32_t * d_flag2 = nullptr;
+    float *             d_y2    = nullptr;
+    volatile unsigned long long * d_stats = nullptr;
 
     void * block = nullptr;
 };
@@ -48,6 +58,12 @@ int  hpcache_cuda_get_device();
 void hpcache_cuda_set_device(int device);
 
 void hpcache_cuda_sync_device();
+
+// Keeps a light kernel running on a card so that the driver does not take it for idle and lower its clocks.
+// A card that is busy for a quarter of every layer drops to a third of its clock, and the drop makes every kernel on it
+// three times as long. Returns a handle for hpcache_cuda_keepalive_stop, or nullptr.
+void * hpcache_cuda_keepalive_start(int device);
+void   hpcache_cuda_keepalive_stop(void * handle);
 
 // slot table of one layer: expert id -> pool slot or -1, in device memory
 int32_t * hpcache_cuda_table_alloc(int n_expert);
