@@ -57,6 +57,12 @@ if (HPCACHE_WITH_CUDA)
     # the shared runtime, like ggml-cuda: one runtime instance and one context per process
     target_link_libraries(${TARGET} PUBLIC CUDA::cudart)
     target_compile_definitions(${TARGET} PRIVATE HPCACHE_CUDA)
+    # benchmark event log, see hpcache-metrics.h; off unless asked for, the stamps and the logger are not compiled
+    option(HPCACHE_EVENT_LOG "moe-hpcache: build the event log for benchmarks" OFF)
+    if (HPCACHE_EVENT_LOG)
+        target_sources(${TARGET} PRIVATE hpcache-metrics.cpp hpcache-metrics.h)
+        target_compile_definitions(${TARGET} PRIVATE HPCACHE_EVENT_LOG)
+    endif()
 endif()
 
 if (WIN32)
