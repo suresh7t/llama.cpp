@@ -4,6 +4,16 @@
 #include <cstdint>
 #include <string>
 
+#ifdef HPCACHE_EVENT_LOG
+#include "hpcache-metrics.h"
+// the log's argument of a kernel, nothing when the log is not built
+#define HPCACHE_LOG_PARAM(x) , x
+#define HPCACHE_LOG_ARG(x) , x
+#else
+#define HPCACHE_LOG_PARAM(x)
+#define HPCACHE_LOG_ARG(x)
+#endif
+
 // pinned host memory that the GPU and the CPU follower share
 struct hpcache_doorbell {
     int n_embd = 0;
@@ -41,8 +51,31 @@ struct hpcache_doorbell {
     float *             d_y2    = nullptr;
     volatile unsigned long long * d_stats = nullptr;
 
+    // The split of the missed experts of a layer between the CPU and the PCIe path: the number of experts for the PCIe path
+    // for [the second card has experts of the layer][pool hits][misses], see hpcache_gtab_index. Both sides read it, so
+    // they pick the same experts. The kernels get d_gtab only when the table is in use, else the split follows the share frac.
+    volatile int8_t * gtab   = nullptr;
+    int8_t *          d_gtab = nullptr;
+
+#ifdef HPCACHE_EVENT_LOG
+    // event log of the first card, see hpcache-metrics.h; rec is NULL until the log is started
+    hpcache_metric_dev lead_m;
+#endif
+
     void * block = nullptr;
 };
+
+// The last op of the graph of the second card: copies the result into the pinned memory that the first card reads and
+// sets the flag, so the worker thread does not wait for the card or copy the result back. seq is the sequence number
+// of the request, in the input block of the graph.
+void hpcache_cuda_g2_finish(void * stream, const hpcache_doorbell & db, const float * out, const volatile uint32_t * seq);
+
+// a copy of host memory in the memory of a card, NULL on failure (the split table: a kernel that read it from the pinned
+// memory waited behind the PCIe copy of the experts for every block)
+int8_t * hpcache_cuda_upload(int device, const void * host, size_t bytes);
+
+static constexpr int hpcache_gtab_size = 2 * 33 * 33;
+static inline int hpcache_gtab_index(bool two, int hits, int misses) { return ((two ? 1 : 0) * 33 + hits) * 33 + misses; }
 
 bool hpcache_doorbell_init(hpcache_doorbell & db, int n_embd, int k, std::string & error);
 void hpcache_doorbell_free(hpcache_doorbell & db);
@@ -64,6 +97,7 @@ void hpcache_cuda_sync_device();
 // three times as long. Returns a handle for hpcache_cuda_keepalive_stop, or nullptr.
 void * hpcache_cuda_keepalive_start(int device);
 void   hpcache_cuda_keepalive_stop(void * handle);
+
 
 // slot table of one layer: expert id -> pool slot or -1, in device memory
 int32_t * hpcache_cuda_table_alloc(int n_expert);
@@ -99,7 +133,7 @@ int hpcache_cuda_device_by_pci(const char * pci_bus_id);
 // order, the last g, g = min(m, (misses * frac256) >> 8). out_ids / out_w hold m entries, the unused ones repeat an
 // expert with weight 0. Either output may be NULL. table may be NULL (no pool: every expert is a miss).
 void hpcache_cuda_pcie_select(void * stream, const int32_t * ids, const float * w, const int32_t * table,
-        int k, int n_expert, int m, const volatile int32_t * frac256, int32_t * out_ids, float * out_w);
+        int k, int n_expert, int m, const volatile int32_t * frac256, const volatile int8_t * gtab, int32_t * out_ids, float * out_w);
 
 // Experts that the GPU fetches itself: the stage kernel copies the experts selected by the rule above from the
 // page-locked arena (read through PCIe) into device staging slots, one slot per selected expert.
@@ -109,8 +143,11 @@ struct hpcache_stage_args {
     size_t       bytes[4]  = {};     // bytes of one expert, also the distance between experts
     void *       dst[4]    = {};     // staging slot 0 of each tensor
 };
+// With side the copy runs on a stream of its own that forks from `stream` at this point, so what is queued on `stream` after
+// it computes while the copy runs; hpcache_cuda_pcie_stage_join makes `stream` wait for the copy.
 void hpcache_cuda_pcie_stage(void * stream, const int32_t * ids, const int32_t * table, int k, int n_expert, int m,
-        const volatile int32_t * frac256, const hpcache_stage_args & args);
+        const volatile int32_t * frac256, const volatile int8_t * gtab, const hpcache_stage_args & args, bool side);
+void hpcache_cuda_pcie_stage_join(void * stream);
 
 // the device address of a registered host pointer, NULL when it is not registered for mapping
 void * hpcache_cuda_host_device_ptr(const void * ptr);
