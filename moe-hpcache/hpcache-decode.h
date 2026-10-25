@@ -3,6 +3,13 @@
 #include "hpcache-cpu.h"
 #include "hpcache-arena.h"
 #include "hpcache-cuda.h"
+#ifdef HPCACHE_EVENT_LOG
+#include "hpcache-metrics.h"
+// a host thread logs into its own ring; without HPCACHE_EVENT_LOG the call is not compiled
+#define HPCACHE_LOG(ring, ...) do { if ((ring) != nullptr) { hpcache_metrics::host_log(*(ring), __VA_ARGS__); } } while (0)
+#else
+#define HPCACHE_LOG(...) do { } while (0)
+#endif
 #include "llama-moe-provider.h"
 
 #include <atomic>
@@ -77,6 +84,8 @@ public:
         const volatile int32_t * pcie_frac = nullptr;   // device address of the share, read by the kernels
         const hpcache_stage_args * stage = nullptr;
         int32_t miss_id = 0;     // id of a missed expert in the pool ops: 0, or -1 when the matvec skips it
+        int stamp_event = 0;     // event log: the event a stamp op records
+        const ggml_tensor * g2_in = nullptr;   // second card: its input block, holds the sequence number
     };
 
 private:
@@ -98,6 +107,31 @@ private:
     void follower2();
     void serve2(uint32_t seq);
     void warm_gpu2();
+public:
+    void g2_finish(void * stream, const ggml_tensor * dst, const op_ctx * c);   // from the last op of the second card's graph
+    const int8_t * gtab_dev = nullptr;   // the split table in the memory of the first card, NULL when the share is used
+private:
+    // the graph of the second card ends with an op that writes the result and the flag, HPCACHE_G2_HOST_DONE=1 turns it off
+    bool g2_device_done = true;
+#ifdef HPCACHE_EVENT_LOG
+    // event log for benchmarks, see hpcache-metrics.h: built with HPCACHE_EVENT_LOG, HPCACHE_STEPS=<csv path> turns it on
+    void steps_calibrate();
+    void steps_start();
+    bool steps_on = false;
+    bool steps_calibrated = false;
+    // host clock minus the globaltimer of the first and the second card, at the first calibration and at the latest one; the
+    // clocks drift against each other by some ppm, which is 100 us over a 10 s run
+    long long steps_off_lead = 0, steps_off_g2 = 0;
+    long long steps_off_lead_0 = 0, steps_off_g2_0 = 0, steps_host_0 = 0, steps_host_1 = 0;
+    std::deque<op_ctx> steps_ctxs;
+    hpcache_metrics metrics;
+    // one ring per producer: the stream of each card, the CPU follower, the worker of the second card, the graph thread
+    hpcache_metric_ring * ring_lead = nullptr, * ring_g2 = nullptr, * ring_cpu = nullptr, * ring_w2 = nullptr, * ring_main = nullptr;
+public:
+    void stamp(void * stream, int event, int il);         // from a stamp op of the first card's graph
+    void stamp_g2(void * stream, const op_ctx * c);       // from a stamp op of the second card's graph
+private:
+#endif
     bool device_free_bytes(size_t & free_bytes, size_t & total_bytes) const;   // true when read from NVML
     bool device_free_bytes(ggml_backend_dev_t dev, size_t & free_bytes, size_t & total_bytes) const;
     bool copy_slot(layer & l, int slot, int e);
@@ -120,6 +154,10 @@ private:
     int64_t  pub_waits = 0, pub_blocked = 0, pub_wait_us_sum = 0, pub_wait_us_max = 0;
     // balance of the two expert paths: the share moves so that the GPU waits a little for the CPU
     void     adapt_share();
+    // the split of the missed experts of a layer between the CPU and the PCIe path, from a model of the three lanes
+    // (HPCACHE_GTAB=0 uses the share instead, HPCACHE_LANE_MODEL=c3_0,c3_h,c3_g,cc_0,cc_e,c2_0,c2_e sets the model)
+    void fill_gtab();
+    bool gtab_on = false;
     float    share_now = 0.55f;
     int64_t  adapt_last_decode = 0, adapt_last_serve = 0;
     unsigned long long adapt_last_wait_ns = 0;

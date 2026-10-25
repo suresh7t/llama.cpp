@@ -1,6 +1,7 @@
 #include "hpcache-decode.h"
 
 #include "ggml-backend.h"
+#include "ggml-impl.h"
 
 #include <algorithm>
 #include <chrono>
@@ -67,6 +68,12 @@ struct hpcache_decoder::cpu_graph {
 static constexpr int gpu2_in_max_k = 32;   // 32 ids and 32 weights fill their 128 bytes
 static size_t gpu2_in_ids_off(int n_embd) { return (size_t(n_embd) * sizeof(float) + 127) & ~size_t(127); }
 static size_t gpu2_in_w_off(int n_embd)   { return gpu2_in_ids_off(n_embd) + 128; }
+static size_t gpu2_in_stamp_off(int n_embd) { return gpu2_in_w_off(n_embd) + 128; }   // step trace: the sequence number, 8 bytes
+static constexpr size_t gpu2_in_bytes_extra = 16;
+#ifdef HPCACHE_EVENT_LOG
+static void stamp_g2_cb(ggml_tensor * dst, int, int, void * userdata);
+#endif
+static void g2_finish_cb(ggml_tensor * dst, int, int, void * userdata);
 
 struct hpcache_decoder::layer {
     // expert tensors that the graphs read, to notice a different model
@@ -353,6 +360,13 @@ bool hpcache_decoder::attach_arena(layer & l) {
 }
 
 hpcache_decoder::~hpcache_decoder() {
+#ifdef HPCACHE_EVENT_LOG
+    if (steps_on) {
+        metrics.offset(HPC_LEAD, steps_off_lead_0, steps_off_lead, steps_host_0, steps_host_1);
+        metrics.offset(HPC_G2, steps_off_g2_0, steps_off_g2, steps_host_0, steps_host_1);
+        metrics.close();
+    }
+#endif
     if (n_decode.load() > 0 && n_serve.load() > 0) {
         char buf[256];
         snprintf(buf, sizeof(buf),
@@ -510,6 +524,11 @@ bool hpcache_decoder::ensure_doorbell(int n_embd, int k) {
     }
     share_now = std::min(0.9f, std::max(0.0f, opts.pcie_frac));
     *db.frac = int(share_now * 256.0f + 0.5f);
+    fill_gtab();
+    g2_device_done = getenv("HPCACHE_G2_HOST_DONE") == nullptr || atoi(getenv("HPCACHE_G2_HOST_DONE")) == 0;
+#ifdef HPCACHE_EVENT_LOG
+    steps_on = getenv("HPCACHE_STEPS") != nullptr && getenv("HPCACHE_STEPS")[0] != 0;
+#endif
     return true;
 }
 
@@ -613,7 +632,7 @@ hpcache_decoder::cpu_graph * hpcache_decoder::gpu2_graph_for(layer & l, int m) {
     ggml_context * ctx = g->ctx;
 
     // x, ids and w are windows of the first tensor, so the one allocation below places all of them and one copy fills them
-    g->in  = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, gpu2_in_ids_off(l.n_embd) + gpu2_in_max_k * 8);
+    g->in  = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, gpu2_in_ids_off(l.n_embd) + gpu2_in_max_k * 8 + gpu2_in_bytes_extra);
     g->x   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, l.n_embd, 1, 1);
     g->ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, m, 1);
     g->w   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, m, 1);
@@ -626,7 +645,46 @@ hpcache_decoder::cpu_graph * hpcache_decoder::gpu2_graph_for(layer & l, int m) {
     g->out = build_experts(ctx, l.g_gate_up, l.g_gate, l.g_up, l.g_down, g->x, g->ids, g->w, l.n_embd, m, l.clamp);
 
     g->gf = ggml_new_graph_custom(ctx, graph_size, false);
-    ggml_build_forward_expand(g->gf, g->out);
+    // the last op of the graph writes the result and the flag into the host memory, no host call is needed to read them
+    ggml_tensor * last = g->out;
+    if (g2_device_done) {
+        op_ctx fc = {};
+        fc.decoder = this;
+        fc.il      = -1;
+        fc.g2_in   = g->in;
+        op_ctxs.push_back(fc);
+        ggml_tensor * fs[2] = { g->out, g->in };
+        last = ggml_custom_4d(ctx, GGML_TYPE_F32, 1, 1, 1, 1, fs, 2, g2_finish_cb, 1, &op_ctxs.back());
+        ggml_custom_set_backend_stream(last);
+    }
+#ifdef HPCACHE_EVENT_LOG
+    if (steps_on) {
+        // a stamp before the first op, one after the experts and one after the last op, on the stream of this card
+        auto stamp_op = [&](int field, ggml_tensor * after) {
+            op_ctx sc = {};
+            sc.decoder     = this;
+            sc.stamp_event = field;
+            sc.g2_in       = g->in;
+            sc.il          = -1;
+            steps_ctxs.push_back(sc);
+            ggml_tensor * s[1] = { after };
+            ggml_tensor * t = ggml_custom_4d(ctx, GGML_TYPE_F32, 1, 1, 1, 1, s, 1, stamp_g2_cb, 1, &steps_ctxs.back());
+            ggml_custom_set_backend_stream(t);
+            return t;
+        };
+        ggml_build_forward_expand(g->gf, stamp_op(HPE_G2_GRAPH_START, g->in));
+        ggml_build_forward_expand(g->gf, g->out);
+        ggml_build_forward_expand(g->gf, stamp_op(HPE_G2_GRAPH_STOP, g->out));
+        if (last != g->out) {
+            ggml_build_forward_expand(g->gf, last);
+            ggml_build_forward_expand(g->gf, stamp_op(HPE_G2_FINISH, last));
+        }
+    } else {
+        ggml_build_forward_expand(g->gf, last);
+    }
+#else
+    ggml_build_forward_expand(g->gf, last);
+#endif
 
     g->buf = ggml_backend_alloc_ctx_tensors(ctx, gpu2_backend);
     if (g->buf == nullptr) {
@@ -1507,9 +1565,13 @@ static void publish_cb(ggml_tensor * dst, int, int, void * userdata);
 static void remap_ids_cb(ggml_tensor * dst, int, int, void * userdata);
 static void remap_w_cb(ggml_tensor * dst, int, int, void * userdata);
 static void pcie_stage_cb(ggml_tensor * dst, int, int, void * userdata);
+static void pcie_join_cb(ggml_tensor * dst, int, int, void * userdata);
 static void pcie_ids_cb(ggml_tensor * dst, int, int, void * userdata);
 static void pcie_w_cb(ggml_tensor * dst, int, int, void * userdata);
 static void wait_merge_cb(ggml_tensor * dst, int, int, void * userdata);
+#ifdef HPCACHE_EVENT_LOG
+static void stamp_cb(ggml_tensor * dst, int, int, void * userdata);
+#endif
 
 ggml_tensor * hpcache_decoder::build_layer(const llama_moe_layer_request & req) {
     if (!ok() || req.ffn_op != LLAMA_MOE_FFN_SILU || req.n_tokens != 1 || req.down_exps == nullptr ||
@@ -1585,35 +1647,108 @@ ggml_tensor * hpcache_decoder::build_layer(const llama_moe_layer_request & req) 
     ggml_tensor * merged = ggml_custom_4d(req.ctx, GGML_TYPE_F32, n_embd, 1, 1, 1, wait_src, 1, wait_merge_cb, 1, ud);
     ggml_custom_set_backend_stream(merged);
 
-    // the share of the missed experts that the GPU computes from the arena, through PCIe
-    ggml_tensor * pcie_out = nullptr;
+#ifdef HPCACHE_EVENT_LOG
+    // event log: a stamp on the stream between the first card's own work and the wait, and one after the layer
+    auto stamp_op = [&](int field, ggml_tensor * after) {
+        op_ctx sc = octx;
+        sc.stamp_event = field;
+        steps_ctxs.push_back(sc);
+        ggml_tensor * s[1] = { after };
+        ggml_tensor * t = ggml_custom_4d(req.ctx, GGML_TYPE_F32, 1, 1, 1, 1, s, 1, stamp_cb, 1, &steps_ctxs.back());
+        ggml_custom_set_backend_stream(t);
+        return t;
+    };
+    auto finish = [&](ggml_tensor * gpu_last, ggml_tensor * result) {
+        if (steps_on) {
+            // the wait takes the stamp as its second source, so that it is queued after the first card's experts
+            merged->src[1] = stamp_op(HPE_OWN_EXPERTS_STOP, gpu_last != nullptr ? gpu_last : pub);
+            ggml_build_forward_expand(req.gf, result);
+            ggml_build_forward_expand(req.gf, stamp_op(HPE_LAYER_STOP, result));
+        }
+        return result;
+    };
+#else
+    auto finish = [&](ggml_tensor *, ggml_tensor * result) {
+        return result;
+    };
+#endif
+
+#ifdef HPCACHE_EVENT_LOG
+    // The attention and the router are in the graph before the provider is called, so the two stamps of the dense steps
+    // go into the node list by hand: one after the last node of the previous layer, one before the router.
+    // The records are those of the previous layer, the sequence number has not moved yet.
+    if (steps_on) {
+        char name_last[GGML_MAX_NAME];
+        char name_route[GGML_MAX_NAME];
+        snprintf(name_last, sizeof(name_last), "l_last-%d", req.il - 1);
+        snprintf(name_route, sizeof(name_route), "ffn_moe_logits-%d", req.il);
+        int at_last = -1;
+        int at_route = -1;
+        for (int i = 0; i < req.gf->n_nodes; ++i) {
+            const char * nm = req.gf->nodes[i]->name;
+            at_last  = req.il > 0 && strcmp(nm, name_last) == 0 ? i : at_last;
+            at_route = strcmp(nm, name_route) == 0 ? i : at_route;
+        }
+        auto insert_at = [&](int pos, ggml_tensor * t) {
+            std::memmove(req.gf->nodes + pos + 1, req.gf->nodes + pos, (req.gf->n_nodes - pos) * sizeof(ggml_tensor *));
+            req.gf->nodes[pos] = t;
+            req.gf->n_nodes++;
+            t->flags |= GGML_TENSOR_FLAG_COMPUTE;
+            ggml_hash_insert(&req.gf->visited_hash_set, t);
+        };
+        if (req.il == 0 && req.gf->n_nodes > 1) {
+            HPCACHE_LOG(ring_main, HPE_BUILD, (uint32_t) n_decode.load(), -2);
+            insert_at(1, stamp_op(HPE_GRAPH_START, req.gf->nodes[0]));
+            at_route++;
+        }
+        if (at_route > 0) {
+            insert_at(at_route, stamp_op(HPE_ROUTER_START, req.cur));
+        }
+        if (at_last >= 0) {
+            insert_at(at_last + 1, stamp_op(HPE_LAYER_IN, req.gf->nodes[at_last]));
+        }
+    }
+#endif
+
+    // The share of the missed experts that the GPU computes from the arena, through PCIe. The fetch is queued on a stream of
+    // its own right after the ring, and the pool experts below are queued ahead of the join, so they compute while it copies.
+    // The ops that read the fetched experts come after the pool experts, below.
+    ggml_tensor * stg = nullptr;
     if (l->pcie) {
-        const int m = op_ctxs.back().pcie_m;
-        // the fetch is queued after the ring, the ops that use its result read `stg`
         ggml_tensor * ssrc[2] = { req.selected_experts, pub };
-        ggml_tensor * stg = ggml_custom_4d(req.ctx, GGML_TYPE_F32, 1, 1, 1, 1, ssrc, 2, pcie_stage_cb, 1, ud);
+        stg = ggml_custom_4d(req.ctx, GGML_TYPE_F32, 1, 1, 1, 1, ssrc, 2, pcie_stage_cb, 1, ud);
         ggml_custom_set_backend_stream(stg);
-        ggml_tensor * psrc[2] = { req.selected_experts, stg };
+    }
+    ggml_tensor * pcie_out = nullptr;
+    // the PCIe ops, queued after `after` (the last of the pool experts, or the fetch when there is no pool)
+    auto build_pcie = [&](ggml_tensor * after) {
+        const int m = op_ctxs.back().pcie_m;
+        ggml_tensor * jsrc[2] = { stg, after };
+        ggml_tensor * stj = ggml_custom_4d(req.ctx, GGML_TYPE_F32, 1, 1, 1, 1, jsrc, 2, pcie_join_cb, 1, ud);
+        ggml_custom_set_backend_stream(stj);
+        ggml_tensor * psrc[2] = { req.selected_experts, stj };
         ggml_tensor * p_ids = ggml_custom_4d(req.ctx, GGML_TYPE_I32, m, 1, 1, 1, psrc, 2, pcie_ids_cb, 1, ud);
         ggml_custom_set_backend_stream(p_ids);
-        ggml_tensor * pw_src[3] = { req.selected_experts, req.weights, stg };
+        ggml_tensor * pw_src[3] = { req.selected_experts, req.weights, stj };
         ggml_tensor * p_w = ggml_custom_4d(req.ctx, GGML_TYPE_F32, 1, m, 1, 1, pw_src, 3, pcie_w_cb, 1, ud);
         ggml_custom_set_backend_stream(p_w);
         ggml_tensor * px = ggml_reshape_3d(req.ctx, req.cur, n_embd, 1, 1);
         pcie_out = build_experts(req.ctx, l->a_gate_up, l->a_gate, l->a_up, l->a_down, px, p_ids, p_w, n_embd, m, req.swiglu_clamp);
-    }
+    };
 
     if (l->n_slots == 0) {
-        if (pcie_out != nullptr) {
-            return ggml_add(req.ctx, pcie_out, ggml_reshape_2d(req.ctx, merged, n_embd, 1));
+        if (stg != nullptr) {
+            build_pcie(stg);
+            return finish(pcie_out, ggml_add(req.ctx, pcie_out, ggml_reshape_2d(req.ctx, merged, n_embd, 1)));
         }
-        return merged;
+        return finish(nullptr, merged);
     }
 
     // experts in the pool run on the GPU while the CPU serves the rest
     // the remap ops read pub, so that they are queued after the ring
-    ggml_tensor * ids_src[2] = { req.selected_experts, pub };
-    ggml_tensor * slot_ids = ggml_custom_4d(req.ctx, GGML_TYPE_I32, k, 1, 1, 1, ids_src, 2, remap_ids_cb, 1, ud);
+    // the fetch is a source of the first pool op, so that it is queued before the pool experts
+    ggml_tensor * ids_src[3] = { req.selected_experts, pub, stg };
+    ggml_tensor * slot_ids = ggml_custom_4d(req.ctx, GGML_TYPE_I32, k, 1, 1, 1, ids_src, stg != nullptr ? 3 : 2, remap_ids_cb, 1, ud);
     ggml_custom_set_backend_stream(slot_ids);
 
     ggml_tensor * w_src[3] = { req.selected_experts, req.weights, pub };
@@ -1625,10 +1760,11 @@ ggml_tensor * hpcache_decoder::build_layer(const llama_moe_layer_request & req) 
             n_embd, k, req.swiglu_clamp);
 
     // the GPU part is the first operand, so it is queued before the wait
-    if (pcie_out != nullptr) {
+    if (stg != nullptr) {
+        build_pcie(hit);
         hit = ggml_add(req.ctx, hit, pcie_out);
     }
-    return ggml_add(req.ctx, hit, ggml_reshape_2d(req.ctx, merged, n_embd, 1));
+    return finish(hit, ggml_add(req.ctx, hit, ggml_reshape_2d(req.ctx, merged, n_embd, 1)));
 }
 
 void hpcache_decoder::publish(void * s, int il, const ggml_tensor * x, const ggml_tensor * ids, const ggml_tensor * w) {
@@ -1672,21 +1808,29 @@ static void remap_w_cb(ggml_tensor * dst, int, int, void * userdata) {
 
 static void pcie_stage_cb(ggml_tensor * dst, int, int, void * userdata) {
     auto * c = static_cast<hpcache_decoder::op_ctx *>(userdata);
+    static const bool side = getenv("HPCACHE_PCIE_SIDE") == nullptr || atoi(getenv("HPCACHE_PCIE_SIDE")) != 0;
     hpcache_cuda_pcie_stage(ggml_custom_get_backend_stream(dst), (const int32_t *) dst->src[0]->data, c->table,
-            (int) dst->src[0]->ne[0], c->n_expert, c->pcie_m, c->pcie_frac, *c->stage);
+            (int) dst->src[0]->ne[0], c->n_expert, c->pcie_m, c->pcie_frac, c->decoder->gtab_dev, *c->stage, side);
+}
+
+static void pcie_join_cb(ggml_tensor * dst, int, int, void *) {
+    static const bool side = getenv("HPCACHE_PCIE_SIDE") == nullptr || atoi(getenv("HPCACHE_PCIE_SIDE")) != 0;
+    if (side) {
+        hpcache_cuda_pcie_stage_join(ggml_custom_get_backend_stream(dst));
+    }
 }
 
 static void pcie_ids_cb(ggml_tensor * dst, int, int, void * userdata) {
     auto * c = static_cast<hpcache_decoder::op_ctx *>(userdata);
     hpcache_cuda_pcie_select(ggml_custom_get_backend_stream(dst), (const int32_t *) dst->src[0]->data, nullptr, c->table,
-            (int) dst->src[0]->ne[0], c->n_expert, (int) dst->ne[0], c->pcie_frac, (int32_t *) dst->data, nullptr);
+            (int) dst->src[0]->ne[0], c->n_expert, (int) dst->ne[0], c->pcie_frac, c->decoder->gtab_dev, (int32_t *) dst->data, nullptr);
 }
 
 static void pcie_w_cb(ggml_tensor * dst, int, int, void * userdata) {
     auto * c = static_cast<hpcache_decoder::op_ctx *>(userdata);
     hpcache_cuda_pcie_select(ggml_custom_get_backend_stream(dst), (const int32_t *) dst->src[0]->data,
             (const float *) dst->src[1]->data, c->table, (int) dst->src[0]->ne[0], c->n_expert, (int) dst->ne[1],
-            c->pcie_frac, nullptr, (float *) dst->data);
+            c->pcie_frac, c->decoder->gtab_dev, nullptr, (float *) dst->data);
 }
 
 static void wait_merge_cb(ggml_tensor * dst, int, int, void * userdata) {
@@ -1694,8 +1838,93 @@ static void wait_merge_cb(ggml_tensor * dst, int, int, void * userdata) {
     c->decoder->wait_merge(ggml_custom_get_backend_stream(dst), dst);
 }
 
+#ifdef HPCACHE_EVENT_LOG
+static void stamp_cb(ggml_tensor * dst, int, int, void * userdata) {
+    auto * c = static_cast<hpcache_decoder::op_ctx *>(userdata);
+    c->decoder->stamp(ggml_custom_get_backend_stream(dst), c->stamp_event, c->il);
+}
+
+static void stamp_g2_cb(ggml_tensor * dst, int, int, void * userdata) {
+    auto * c = static_cast<hpcache_decoder::op_ctx *>(userdata);
+    c->decoder->stamp_g2(ggml_custom_get_backend_stream(dst), c);
+}
+
+void hpcache_decoder::stamp(void * s, int event, int il) {
+    if (ring_lead != nullptr) {
+        hpcache_cuda_device_log(s, *ring_lead, (uint16_t) event, db.d_seq, il);
+    }
+}
+
+void hpcache_decoder::stamp_g2(void * s, const op_ctx * c) {
+    // the sequence number sits in the input block of the second card's graph, in its own memory
+    const auto * seq = (const volatile uint32_t *) ((const char *) c->g2_in->data + gpu2_in_stamp_off(db.n_embd));
+    if (ring_g2 != nullptr) {
+        hpcache_cuda_device_log(s, *ring_g2, (uint16_t) c->stamp_event, seq, -1);
+    }
+}
+
+// the rings are made before the producers start: the logger thread does not look at a ring list that grows
+void hpcache_decoder::steps_start() {
+    ring_lead = metrics.add_ring(HPC_LEAD, pool_device_index >= 0 ? pool_device_index : hpcache_cuda_get_device());
+    ring_g2   = gpu2_index >= 0 && gpu2_active() ? metrics.add_ring(HPC_G2, gpu2_index) : nullptr;
+    ring_cpu  = metrics.add_ring(HPC_HOST, -1);
+    ring_w2   = metrics.add_ring(HPC_HOST, -1);
+    ring_main = metrics.add_ring(HPC_HOST, -1);
+    db.lead_m = ring_lead != nullptr ? ring_lead->view() : hpcache_metric_dev();
+    if (!metrics.open(getenv("HPCACHE_STEPS"))) {
+        log(GGML_LOG_LEVEL_WARN, "event log: cannot open the file");
+    }
+}
+
+// the clocks of the cards and the host, put on one timeline for the trace
+void hpcache_decoder::steps_calibrate() {
+    const bool first_time = !steps_calibrated;
+    steps_calibrated = true;
+    long long rtt = 0;
+    // the first card is the pool device; the current device can be the second card, as after the load of its pool
+    const int current = hpcache_cuda_get_device();
+    const int dev = pool_device_index >= 0 ? pool_device_index : current;
+    if (dev >= 0 && hpcache_cuda_clock_offset(dev, steps_off_lead, rtt)) {
+        if (first_time) log(GGML_LOG_LEVEL_INFO, "step trace: first card clock offset " + std::to_string(steps_off_lead) + " ns, best round trip " +
+                std::to_string(rtt / 1000) + " us");
+    } else {
+        log(GGML_LOG_LEVEL_WARN, "step trace: cannot calibrate the first card's clock");
+    }
+    if (gpu2_index >= 0 && gpu2_active()) {
+        if (hpcache_cuda_clock_offset(gpu2_index, steps_off_g2, rtt)) {
+            if (first_time) log(GGML_LOG_LEVEL_INFO, "step trace: second card clock offset " + std::to_string(steps_off_g2) + " ns, best round trip " +
+                    std::to_string(rtt / 1000) + " us");
+        } else {
+            log(GGML_LOG_LEVEL_WARN, "step trace: cannot calibrate the second card's clock");
+        }
+    }
+    if (current >= 0) {
+        hpcache_cuda_set_device(current);
+    }
+    steps_host_1 = hpcache_metric_now();
+    if (first_time) {
+        steps_off_lead_0 = steps_off_lead;
+        steps_off_g2_0   = steps_off_g2;
+        steps_host_0     = steps_host_1;
+    }
+}
+#endif
+
+static void g2_finish_cb(ggml_tensor * dst, int, int, void * userdata) {
+    auto * c = static_cast<hpcache_decoder::op_ctx *>(userdata);
+    c->decoder->g2_finish(ggml_custom_get_backend_stream(dst), dst, c);
+}
+
+void hpcache_decoder::g2_finish(void * s, const ggml_tensor * dst, const op_ctx * c) {
+    const auto * seq = (const volatile uint32_t *) ((const char *) c->g2_in->data + gpu2_in_stamp_off(db.n_embd));
+    hpcache_cuda_g2_finish(s, db, (const float *) dst->src[0]->data, seq);
+}
+
 void hpcache_decoder::serve(uint32_t seq) {
     const int il = *db.layer;
+    HPCACHE_LOG(ring_cpu, HPE_CPU_START, seq, il);
+    uint32_t n_cpu_experts = 0;
+    uint32_t counts = 0;   // event log: experts on the CPU | on the first card through PCIe << 8 | on the second card << 16 | pool hits << 24
     HPCACHE_TRACE("serve seq %u layer %d", seq, il);
 
     layer * l = nullptr;
@@ -1772,14 +2001,20 @@ void hpcache_decoder::serve(uint32_t seq) {
         n_routed += db.k;
         n_hit    += db.k - m - n2;
         n_gpu2   += n2;
+        int g_logged = 0;
+        const int hits_here = db.k - m - n2;
         if (l->pcie && m > 0) {
             // the GPU takes the last g misses in routing order (pcie_select_kernel), the CPU the first m - g
-            int g = (m * int(*db.frac)) >> 8;
+            int g = gtab_on ? int(db.gtab[hpcache_gtab_index(n2 > 0, hits_here, m)]) : (m * int(*db.frac)) >> 8;
             g = std::min(g, std::min(opts.pcie_max, db.k));
+            g = std::min(g, m);
             m -= g;
             n_pcie_experts += g;
+            g_logged = g;
         }
 
+        n_cpu_experts = m > 0 ? m : 0;
+        counts = n_cpu_experts | uint32_t(g_logged) << 8 | uint32_t(n2) << 16 | uint32_t(hits_here) << 24;
         if (m > 0 && l->fast) {
             cpu_pool->run(l->desc, db.x, ids, w, m, db.y);
             static const bool verify = getenv("HPCACHE_VERIFY") != nullptr;
@@ -1839,6 +2074,7 @@ void hpcache_decoder::serve(uint32_t seq) {
     serve_us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t_start).count();
     n_serve++;
 
+    HPCACHE_LOG(ring_cpu, HPE_CPU_STOP, seq, il, counts);
     std::atomic_thread_fence(std::memory_order_seq_cst);
     *db.flag = seq;
     HPCACHE_TRACE("served seq %u", seq);
@@ -1881,7 +2117,7 @@ void hpcache_decoder::warm_gpu2() {
     const int64_t t0 = adm_now();
     const int dev = hpcache_cuda_get_device();
 
-    const size_t bytes = gpu2_in_w_off(db.n_embd) + 128;
+    const size_t bytes = gpu2_in_stamp_off(db.n_embd) + gpu2_in_bytes_extra;
     ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(gpu2_dev);
     if (host_buft != nullptr) {
         gpu2_stage_buf = ggml_backend_buft_alloc_buffer(host_buft, bytes);
@@ -1901,9 +2137,12 @@ void hpcache_decoder::warm_gpu2() {
             if (g == nullptr) {
                 continue;
             }
-            ggml_backend_tensor_set_async(gpu2_backend, g->in, gpu2_stage, 0, gpu2_in_w_off(db.n_embd) + size_t(m) * sizeof(float));
-            ggml_backend_graph_compute(gpu2_backend, g->gf);
-            ggml_backend_tensor_get(g->out, y.data(), 0, y.size() * sizeof(float));
+            // twice: ggml records the CUDA graph of the card on the second run, which must not happen later in the worker thread
+            for (int run = 0; run < 2; ++run) {
+                ggml_backend_tensor_set_async(gpu2_backend, g->in, gpu2_stage, 0, gpu2_in_w_off(db.n_embd) + size_t(m) * sizeof(float));
+                ggml_backend_graph_compute(gpu2_backend, g->gf);
+                ggml_backend_tensor_get(g->out, y.data(), 0, y.size() * sizeof(float));
+            }
             ++n_graphs;
         }
     }
@@ -1919,6 +2158,8 @@ void hpcache_decoder::warm_gpu2() {
 // experts there answers with zeros.
 void hpcache_decoder::serve2(uint32_t seq) {
     const int il = *db.layer;
+    HPCACHE_LOG(ring_w2, HPE_G2_WORKER_START, seq, il);
+    uint32_t m_two = 0;
     layer * l = nullptr;
     {
         hpcache_sync::spin_guard lock(layers_lock);
@@ -1929,7 +2170,7 @@ void hpcache_decoder::serve2(uint32_t seq) {
     }
 
     if (gpu2_stage == nullptr) {
-        const size_t bytes = gpu2_in_w_off(db.n_embd) + 128;
+        const size_t bytes = gpu2_in_stamp_off(db.n_embd) + gpu2_in_bytes_extra;
         ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(gpu2_dev);
         if (host_buft != nullptr) {
             gpu2_stage_buf = ggml_backend_buft_alloc_buffer(host_buft, bytes);
@@ -1951,24 +2192,38 @@ void hpcache_decoder::serve2(uint32_t seq) {
     }
     if (m > 0) {
         memcpy(gpu2_stage, db.x, size_t(db.n_embd) * sizeof(float));
+        m_two = m;
         const int64_t t0 = adm_now();
         cpu_graph * g = gpu2_graph_for(*l, m);
         if (g == nullptr) {
             GGML_ABORT("moe-hpcache: no graph on the second GPU for layer %d with %d experts", il, m);
         }
         const int64_t t1 = adm_now();
+        // the ops of the graph read the sequence number from the input block
+        *(uint32_t *) (gpu2_stage + gpu2_in_stamp_off(db.n_embd)) = seq;
+        const size_t upload = gpu2_in_stamp_off(db.n_embd) + sizeof(uint32_t);
+        HPCACHE_LOG(ring_w2, HPE_G2_UPLOAD_START, seq, il);
         // queued on the stream of the card, the result read below waits for all of them
-        ggml_backend_tensor_set_async(gpu2_backend, g->in, gpu2_stage, 0, gpu2_in_w_off(db.n_embd) + size_t(m) * sizeof(float));
+        ggml_backend_tensor_set_async(gpu2_backend, g->in, gpu2_stage, 0, upload);
         const int64_t t2 = adm_now();
+        if (g2_device_done) {
+            // the last op of the graph writes y2 and the flag, the next request cannot come before it has
+            ggml_backend_graph_compute_async(gpu2_backend, g->gf);
+            g2_n++; g2_m += m; g2_graph_us += t1 - t0; g2_set_us += t2 - t1; g2_compute_us += adm_now() - t2;
+            HPCACHE_LOG(ring_w2, HPE_G2_WORKER_STOP, seq, il, (uint32_t) m_two);
+            return;
+        }
         ggml_backend_graph_compute(gpu2_backend, g->gf);
         const int64_t t3 = adm_now();
         ggml_backend_tensor_get(g->out, db.y2, 0, size_t(db.n_embd) * sizeof(float));
         const int64_t t4 = adm_now();
+        HPCACHE_LOG(ring_w2, HPE_G2_DOWNLOAD_STOP, seq, il);
         g2_n++; g2_m += m; g2_graph_us += t1 - t0; g2_set_us += t2 - t1; g2_compute_us += t3 - t2; g2_get_us += t4 - t3;
     } else {
         g2_empty++;
         memset(db.y2, 0, size_t(db.n_embd) * sizeof(float));
     }
+    HPCACHE_LOG(ring_w2, HPE_G2_WORKER_STOP, seq, il, (uint32_t) m_two);
     std::atomic_thread_fence(std::memory_order_seq_cst);
     *db.flag2 = seq;
 }
@@ -2030,6 +2285,19 @@ void hpcache_decoder::arm() {
     if (armed.load(std::memory_order_acquire)) {
         return;
     }
+#ifdef HPCACHE_EVENT_LOG
+    if (steps_on && ring_main == nullptr) {
+        steps_start();
+    }
+#endif
+    if (gtab_on && gtab_dev == nullptr) {
+        gtab_dev = hpcache_cuda_upload(pool_device_index >= 0 ? pool_device_index : hpcache_cuda_get_device(), (const void *) db.gtab,
+                hpcache_gtab_size);
+        if (gtab_dev == nullptr) {
+            log(GGML_LOG_LEVEL_ERROR, "cannot copy the split table to the first card, the share is used");
+            gtab_on = false;
+        }
+    }
     if (!thread.joinable()) {
         thread = std::thread([this] { follower(); });
     }
@@ -2039,6 +2307,14 @@ void hpcache_decoder::arm() {
         if (!gpu2_warm) {
             warm_gpu2();
         }
+    }
+    // no worker is running yet and no kernel of the graph spins, so the probe kernels cannot meet a runtime lock
+#ifdef HPCACHE_EVENT_LOG
+    if (steps_on && !steps_calibrated) {
+        steps_calibrate();
+    }
+#endif
+    if (db.two) {
         if (!thread2.joinable()) {
             thread2 = std::thread([this] { follower2(); });
         }
@@ -2060,6 +2336,7 @@ void hpcache_decoder::begin(const llama_moe_decode_info & info) {
     if (info.n_tokens != 1 || db.block == nullptr || !ok()) {
         return;
     }
+    HPCACHE_LOG(ring_main, HPE_BEGIN_ENTER, (uint32_t) n_decode.load(), -2);
     HPCACHE_TRACE("begin");
     if (!pool_grown) {
         grow_pool();
@@ -2070,6 +2347,7 @@ void hpcache_decoder::begin(const llama_moe_decode_info & info) {
     decode_start_us.store(std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count());
     arm();
+    HPCACHE_LOG(ring_main, HPE_BEGIN_ARMED, (uint32_t) n_decode.load(), -2);
 }
 
 // Runs while the device and the follower are idle. Per layer, the best missed expert replaces
@@ -2199,6 +2477,43 @@ void hpcache_decoder::admit() {
 // Every 16 steps: how long did the GPU wait for the CPU, per layer? A long wait means the CPU is the slower path and
 // the GPU should take more; no wait means the GPU is the slower one. The share only changes between steps, when no
 // kernel and no follower reads it.
+// The time of a lane, in us, as fitted to the event log (balance.py): the first card, the CPU and the second card. For every
+// case [the second card has experts][pool hits][misses] the number of misses for the PCIe path is the one that makes the
+// longest lane shortest, with the CPU taking the rest. A tie goes to the smaller share.
+void hpcache_decoder::fill_gtab() {
+    const char * off = getenv("HPCACHE_GTAB");
+    gtab_on = opts.pcie && db.gtab != nullptr && (off == nullptr || atoi(off) != 0);
+    if (!gtab_on) {
+        return;
+    }
+    double c3[3] = { 74.0, 9.0, 81.0 };    // first card: fixed, per pool hit, per PCIe expert
+    double cc[2] = { 17.0, 83.0 };          // CPU: fixed, per expert
+    double c2[2] = { 132.0, 22.0 };         // second card: fixed, per expert (when it has experts)
+    if (const char * m = getenv("HPCACHE_LANE_MODEL")) {
+        sscanf(m, "%lf,%lf,%lf,%lf,%lf,%lf,%lf", &c3[0], &c3[1], &c3[2], &cc[0], &cc[1], &c2[0], &c2[1]);
+    }
+    for (int two = 0; two < 2; ++two) {
+        for (int hits = 0; hits <= 32; ++hits) {
+            for (int miss = 0; miss <= 32; ++miss) {
+                int best_g = 0;
+                double best = 1e30;
+                for (int g = 0; g <= std::min(miss, opts.pcie_max); ++g) {
+                    const double t3 = c3[0] + c3[1] * hits + c3[2] * g;
+                    const double tc = cc[0] + cc[1] * (miss - g);
+                    const double t2 = two ? c2[0] + c2[1] * 2 : 0.0;   // two experts on the second card, about the mean
+                    const double t = std::max(t3, std::max(tc, t2));
+                    if (t < best) {
+                        best = t;
+                        best_g = g;
+                    }
+                }
+                db.gtab[hpcache_gtab_index(two != 0, hits, miss)] = (int8_t) best_g;
+            }
+        }
+    }
+    log(GGML_LOG_LEVEL_INFO, "PCIe share per layer from a model of the lanes, " + std::to_string(opts.pcie_max) + " experts at most");
+}
+
 void hpcache_decoder::adapt_share() {
     const int64_t steps_done = n_decode.load();
     if (steps_done - adapt_last_decode < 16) {
@@ -2231,6 +2546,7 @@ void hpcache_decoder::end() {
         return;
     }
 
+    HPCACHE_LOG(ring_main, HPE_END_ENTER, (uint32_t) n_decode.load(), -2);
     // when the device is done, every ring of this graph has been served
     const int dev = device.load();
     if (dev >= 0) {
@@ -2239,6 +2555,7 @@ void hpcache_decoder::end() {
     HPCACHE_TRACE("end: syncing the device");
     hpcache_cuda_sync_device();
     HPCACHE_TRACE("end: device synced");
+    HPCACHE_LOG(ring_main, HPE_END_SYNCED, (uint32_t) n_decode.load(), -2);
 
     armed.store(false, std::memory_order_release);
     follower_sig.notify();
@@ -2248,9 +2565,11 @@ void hpcache_decoder::end() {
         follower2_sig.wait_until([&] { return idle2.load(); });
     }
 
+    HPCACHE_LOG(ring_main, HPE_END_FOLLOWERS_IDLE, (uint32_t) n_decode.load(), -2);
     if (cpu_pool) {
         cpu_pool->set_active(false);
     }
+    HPCACHE_LOG(ring_main, HPE_END_POOL_OFF, (uint32_t) n_decode.load(), -2);
 
     const int64_t now_us = std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -2260,9 +2579,15 @@ void hpcache_decoder::end() {
         n_decode++;
     }
 
-    if (opts.pcie && opts.pcie_adapt && n_pcie_experts > 0 && db.block != nullptr) {
+    if (opts.pcie && opts.pcie_adapt && !gtab_on && n_pcie_experts > 0 && db.block != nullptr) {
         adapt_share();
     }
+    // the second calibration, for the drift of the clocks; it takes close to 100 ms, so it runs once
+#ifdef HPCACHE_EVENT_LOG
+    if (steps_on && steps_calibrated && steps_host_1 == steps_host_0 && n_decode.load() >= 40) {
+        steps_calibrate();
+    }
+#endif
 
     // HPCACHE_STATS_EVERY=N: one line per N decode steps with the window averages
     static const int stats_every = getenv("HPCACHE_STATS_EVERY") ? atoi(getenv("HPCACHE_STATS_EVERY")) : 0;
@@ -2287,8 +2612,10 @@ void hpcache_decoder::end() {
     }
 
     if (pool_used > 0 && opts.swap_every > 0 && ++steps % opts.swap_every == 0) {
+        HPCACHE_LOG(ring_main, HPE_END_ADMIT_START, (uint32_t) n_decode.load(), -2);
         const auto t0 = std::chrono::steady_clock::now();
         admit();
         swap_us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
     }
+    HPCACHE_LOG(ring_main, HPE_END_EXIT, (uint32_t) n_decode.load(), -2);
 }
