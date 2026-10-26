@@ -43,25 +43,14 @@ int llama_batched_bench(int argc, char ** argv) {
 
     // initialize the model
 
-    llama_model_params model_params = common_model_params_to_llama(params);
+    params.n_parallel = n_pl.empty() ? 1 : *std::max_element(n_pl.begin(), n_pl.end());
 
-    llama_model * model = llama_model_load_from_file(params.model.path.c_str(), model_params);
+    auto init = common_init_from_params(params);
+    llama_model   * model = init->model();
+    llama_context * ctx   = init->context();
 
-    if (model == NULL) {
+    if (model == NULL || ctx == NULL) {
         fprintf(stderr , "%s: error: unable to load model\n" , __func__);
-        return 1;
-    }
-
-    llama_context_params ctx_params = common_context_params_to_llama(params);
-
-    // ensure enough sequences are available
-    ctx_params.n_seq_max = n_pl.empty() ? 1 : *std::max_element(n_pl.begin(), n_pl.end());
-
-    llama_context * ctx = llama_init_from_model(model, ctx_params);
-
-    if (ctx == NULL) {
-        fprintf(stderr , "%s: error: failed to create the llama_context\n" , __func__);
-        llama_model_free(model);
         return 1;
     }
 
@@ -78,7 +67,7 @@ int llama_batched_bench(int argc, char ** argv) {
 
     common_batch batch(ctx);
 
-    // decode in batches of ctx_params.n_batch tokens
+    // decode in batches of llama_n_batch(ctx) tokens
     auto decode_helper = [](llama_context * ctx, common_batch & batch, int32_t n_batch, bool synchronize) {
         for (int32_t i = 0; i < batch.size(); i += n_batch) {
             const int32_t n_tokens = std::min(n_batch, batch.size() - i);
@@ -103,17 +92,15 @@ int llama_batched_bench(int argc, char ** argv) {
             batch.add(get_token_rand(), i, 0, false);
         }
 
-        if (!decode_helper(ctx, batch, ctx_params.n_batch, true)) {
+        if (!decode_helper(ctx, batch, llama_n_batch(ctx), true)) {
             LOG_ERR("%s: llama_decode() failed\n", __func__);
-            llama_free(ctx);
-            llama_model_free(model);
             return 1;
         }
     }
 
     if (!params.batched_bench_output_jsonl) {
         LOG("\n");
-        LOG("%s: n_kv_max = %d, n_batch = %d, n_ubatch = %d, flash_attn = %d, is_pp_shared = %d, is_tg_separate = %d, n_gpu_layers = %d, n_threads = %u, n_threads_batch = %u\n", __func__, n_kv_max, params.n_batch, params.n_ubatch, int(params.flash_attn_type), is_pp_shared, is_tg_separate, params.n_gpu_layers, ctx_params.n_threads, ctx_params.n_threads_batch);
+        LOG("%s: n_kv_max = %d, n_batch = %d, n_ubatch = %d, flash_attn = %d, is_pp_shared = %d, is_tg_separate = %d, n_gpu_layers = %d, n_threads = %u, n_threads_batch = %u\n", __func__, n_kv_max, params.n_batch, params.n_ubatch, int(params.flash_attn_type), is_pp_shared, is_tg_separate, params.n_gpu_layers, params.cpuparams.n_threads, params.cpuparams_batch.n_threads);
         LOG("\n");
         LOG("|%6s | %6s | %4s | %6s | %8s | %8s | %8s | %8s | %8s | %8s |\n", "PP", "TG", "B", "N_KV", "T_PP s", "S_PP t/s", "T_TG s", "S_TG t/s", "T s", "S t/s");
         LOG("|%6s-|-%6s-|-%4s-|-%6s-|-%8s-|-%8s-|-%8s-|-%8s-|-%8s-|-%8s-|\n", "------", "------", "----", "------", "--------", "--------", "--------", "--------", "--------", "--------");
@@ -144,10 +131,8 @@ int llama_batched_bench(int argc, char ** argv) {
 
                 const auto t_pp_start = ggml_time_us();
 
-                if (!decode_helper(ctx, batch, ctx_params.n_batch, false)) {
+                if (!decode_helper(ctx, batch, llama_n_batch(ctx), false)) {
                     LOG_ERR("%s: llama_decode() failed\n", __func__);
-                    llama_free(ctx);
-                    llama_model_free(model);
                     return 1;
                 }
 
@@ -164,10 +149,8 @@ int llama_batched_bench(int argc, char ** argv) {
                         // run one dummy token to apply the memory copy
                         batch.clear();
                         batch.add(get_token_rand(), pp + 0, 0, true);
-                        if (!decode_helper(ctx, batch, ctx_params.n_batch, true)) {
+                        if (!decode_helper(ctx, batch, llama_n_batch(ctx), true)) {
                             LOG_ERR("%s: llama_decode() failed\n", __func__);
-                            llama_free(ctx);
-                            llama_model_free(model);
                             return 1;
                         }
                         llama_memory_seq_rm(mem, 0, pp, -1);
@@ -185,10 +168,8 @@ int llama_batched_bench(int argc, char ** argv) {
 
                             batch.add(get_token_rand(), pp + i, j, true);
 
-                            if (!decode_helper(ctx, batch, ctx_params.n_batch, true)) {
+                            if (!decode_helper(ctx, batch, llama_n_batch(ctx), true)) {
                                 LOG_ERR("%s: llama_decode() failed\n", __func__);
-                                llama_free(ctx);
-                                llama_model_free(model);
                                 return 1;
                             }
                         }
@@ -203,10 +184,8 @@ int llama_batched_bench(int argc, char ** argv) {
                             batch.add(get_token_rand(), pp + i, j, true);
                         }
 
-                        if (!decode_helper(ctx, batch, ctx_params.n_batch, true)) {
+                        if (!decode_helper(ctx, batch, llama_n_batch(ctx), true)) {
                             LOG_ERR("%s: llama_decode() failed\n", __func__);
-                            llama_free(ctx);
-                            llama_model_free(model);
                             return 1;
                         }
                     }
@@ -228,7 +207,7 @@ int llama_batched_bench(int argc, char ** argv) {
                     LOG(
                         "{\"n_kv_max\": %d, \"n_batch\": %d, \"n_ubatch\": %d, \"flash_attn\": %d, \"is_pp_shared\": %d, \"n_gpu_layers\": %d, \"n_threads\": %u, \"n_threads_batch\": %u, "
                         "\"pp\": %d, \"tg\": %d, \"pl\": %d, \"n_kv\": %d, \"t_pp\": %f, \"speed_pp\": %f, \"t_tg\": %f, \"speed_tg\": %f, \"t\": %f, \"speed\": %f}\n",
-                        n_kv_max, params.n_batch, params.n_ubatch, int(params.flash_attn_type), params.is_pp_shared, params.n_gpu_layers, ctx_params.n_threads, ctx_params.n_threads_batch,
+                        n_kv_max, params.n_batch, params.n_ubatch, int(params.flash_attn_type), params.is_pp_shared, params.n_gpu_layers, params.cpuparams.n_threads, params.cpuparams_batch.n_threads,
                         pp, tg, pl, n_kv, t_pp, speed_pp, t_tg, speed_tg, t, speed
                     );
                 } else {
@@ -240,10 +219,6 @@ int llama_batched_bench(int argc, char ** argv) {
 
     LOG("\n");
     llama_perf_context_print(ctx);
-
-
-    llama_free(ctx);
-    llama_model_free(model);
 
     llama_backend_free();
 
