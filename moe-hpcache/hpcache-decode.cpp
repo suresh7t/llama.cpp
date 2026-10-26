@@ -41,6 +41,29 @@ static bool trace_enabled() {
 #define HPCACHE_PAUSE() std::this_thread::yield()
 #endif
 
+// The CUDA backend exports the two calls that run a custom op on its stream (ggml-cuda.cu), looked up once.
+typedef void   (*custom_set_stream_t)(ggml_tensor *);
+typedef void * (*custom_get_stream_t)(const ggml_tensor *);
+
+static void * cuda_proc(const char * name) {
+    ggml_backend_reg_t reg = ggml_backend_reg_by_name("CUDA");
+    return reg != nullptr ? ggml_backend_reg_get_proc_address(reg, name) : nullptr;
+}
+
+static void custom_set_stream(ggml_tensor * tensor) {
+    static const custom_set_stream_t fn = (custom_set_stream_t) cuda_proc("ggml_backend_cuda_custom_set_stream");
+    fn(tensor);
+}
+
+static void * custom_get_stream(const ggml_tensor * tensor) {
+    static const custom_get_stream_t fn = (custom_get_stream_t) cuda_proc("ggml_backend_cuda_custom_get_stream");
+    return fn(tensor);
+}
+
+static bool cuda_stream_api() {
+    return cuda_proc("ggml_backend_cuda_custom_set_stream") != nullptr && cuda_proc("ggml_backend_cuda_custom_get_stream") != nullptr;
+}
+
 // a CPU graph for a fixed number of routed experts
 struct hpcache_decoder::cpu_graph {
     ggml_context *        ctx = nullptr;
@@ -655,7 +678,7 @@ hpcache_decoder::cpu_graph * hpcache_decoder::gpu2_graph_for(layer & l, int m) {
         op_ctxs.push_back(fc);
         ggml_tensor * fs[2] = { g->out, g->in };
         last = ggml_custom_4d(ctx, GGML_TYPE_F32, 1, 1, 1, 1, fs, 2, g2_finish_cb, 1, &op_ctxs.back());
-        ggml_custom_set_backend_stream(last);
+        custom_set_stream(last);
     }
 #ifdef HPCACHE_EVENT_LOG
     if (steps_on) {
@@ -669,7 +692,7 @@ hpcache_decoder::cpu_graph * hpcache_decoder::gpu2_graph_for(layer & l, int m) {
             steps_ctxs.push_back(sc);
             ggml_tensor * s[1] = { after };
             ggml_tensor * t = ggml_custom_4d(ctx, GGML_TYPE_F32, 1, 1, 1, 1, s, 1, stamp_g2_cb, 1, &steps_ctxs.back());
-            ggml_custom_set_backend_stream(t);
+            custom_set_stream(t);
             return t;
         };
         ggml_build_forward_expand(g->gf, stamp_op(HPE_G2_GRAPH_START, g->in));
@@ -1574,7 +1597,7 @@ static void stamp_cb(ggml_tensor * dst, int, int, void * userdata);
 #endif
 
 ggml_tensor * hpcache_decoder::build_layer(const llama_moe_layer_request & req) {
-    if (!ok() || req.ffn_op != LLAMA_MOE_FFN_SILU || req.n_tokens != 1 || req.down_exps == nullptr ||
+    if (!ok() || !cuda_stream_api() || req.ffn_op != LLAMA_MOE_FFN_SILU || req.n_tokens != 1 || req.down_exps == nullptr ||
             (req.gate_exps == nullptr && req.gate_up_exps == nullptr) ||
             (req.gate_up_exps == nullptr && req.up_exps == nullptr) || req.n_expert_used > 32) {
         return nullptr;
@@ -1641,11 +1664,11 @@ ggml_tensor * hpcache_decoder::build_layer(const llama_moe_layer_request & req) 
 
     ggml_tensor * srcs[3] = { req.cur, req.selected_experts, req.weights };
     ggml_tensor * pub = ggml_custom_4d(req.ctx, GGML_TYPE_F32, 1, 1, 1, 1, srcs, 3, publish_cb, 1, ud);
-    ggml_custom_set_backend_stream(pub);
+    custom_set_stream(pub);
 
     ggml_tensor * wait_src[1] = { pub };
     ggml_tensor * merged = ggml_custom_4d(req.ctx, GGML_TYPE_F32, n_embd, 1, 1, 1, wait_src, 1, wait_merge_cb, 1, ud);
-    ggml_custom_set_backend_stream(merged);
+    custom_set_stream(merged);
 
 #ifdef HPCACHE_EVENT_LOG
     // event log: a stamp on the stream between the first card's own work and the wait, and one after the layer
@@ -1655,7 +1678,7 @@ ggml_tensor * hpcache_decoder::build_layer(const llama_moe_layer_request & req) 
         steps_ctxs.push_back(sc);
         ggml_tensor * s[1] = { after };
         ggml_tensor * t = ggml_custom_4d(req.ctx, GGML_TYPE_F32, 1, 1, 1, 1, s, 1, stamp_cb, 1, &steps_ctxs.back());
-        ggml_custom_set_backend_stream(t);
+        custom_set_stream(t);
         return t;
     };
     auto finish = [&](ggml_tensor * gpu_last, ggml_tensor * result) {
@@ -1717,7 +1740,7 @@ ggml_tensor * hpcache_decoder::build_layer(const llama_moe_layer_request & req) 
     if (l->pcie) {
         ggml_tensor * ssrc[2] = { req.selected_experts, pub };
         stg = ggml_custom_4d(req.ctx, GGML_TYPE_F32, 1, 1, 1, 1, ssrc, 2, pcie_stage_cb, 1, ud);
-        ggml_custom_set_backend_stream(stg);
+        custom_set_stream(stg);
     }
     ggml_tensor * pcie_out = nullptr;
     // the PCIe ops, queued after `after` (the last of the pool experts, or the fetch when there is no pool)
@@ -1725,13 +1748,13 @@ ggml_tensor * hpcache_decoder::build_layer(const llama_moe_layer_request & req) 
         const int m = op_ctxs.back().pcie_m;
         ggml_tensor * jsrc[2] = { stg, after };
         ggml_tensor * stj = ggml_custom_4d(req.ctx, GGML_TYPE_F32, 1, 1, 1, 1, jsrc, 2, pcie_join_cb, 1, ud);
-        ggml_custom_set_backend_stream(stj);
+        custom_set_stream(stj);
         ggml_tensor * psrc[2] = { req.selected_experts, stj };
         ggml_tensor * p_ids = ggml_custom_4d(req.ctx, GGML_TYPE_I32, m, 1, 1, 1, psrc, 2, pcie_ids_cb, 1, ud);
-        ggml_custom_set_backend_stream(p_ids);
+        custom_set_stream(p_ids);
         ggml_tensor * pw_src[3] = { req.selected_experts, req.weights, stj };
         ggml_tensor * p_w = ggml_custom_4d(req.ctx, GGML_TYPE_F32, 1, m, 1, 1, pw_src, 3, pcie_w_cb, 1, ud);
-        ggml_custom_set_backend_stream(p_w);
+        custom_set_stream(p_w);
         ggml_tensor * px = ggml_reshape_3d(req.ctx, req.cur, n_embd, 1, 1);
         pcie_out = build_experts(req.ctx, l->a_gate_up, l->a_gate, l->a_up, l->a_down, px, p_ids, p_w, n_embd, m, req.swiglu_clamp);
     };
@@ -1749,11 +1772,11 @@ ggml_tensor * hpcache_decoder::build_layer(const llama_moe_layer_request & req) 
     // the fetch is a source of the first pool op, so that it is queued before the pool experts
     ggml_tensor * ids_src[3] = { req.selected_experts, pub, stg };
     ggml_tensor * slot_ids = ggml_custom_4d(req.ctx, GGML_TYPE_I32, k, 1, 1, 1, ids_src, stg != nullptr ? 3 : 2, remap_ids_cb, 1, ud);
-    ggml_custom_set_backend_stream(slot_ids);
+    custom_set_stream(slot_ids);
 
     ggml_tensor * w_src[3] = { req.selected_experts, req.weights, pub };
     ggml_tensor * w_hit = ggml_custom_4d(req.ctx, GGML_TYPE_F32, 1, k, 1, 1, w_src, 3, remap_w_cb, 1, ud);
-    ggml_custom_set_backend_stream(w_hit);
+    custom_set_stream(w_hit);
 
     ggml_tensor * x = ggml_reshape_3d(req.ctx, req.cur, n_embd, 1, 1);
     ggml_tensor * hit = build_experts(req.ctx, l->p_gate_up, l->p_gate, l->p_up, l->p_down, x, slot_ids, w_hit,
@@ -1791,62 +1814,62 @@ void hpcache_decoder::wait_merge(void * s, ggml_tensor * dst) {
 
 static void publish_cb(ggml_tensor * dst, int, int, void * userdata) {
     auto * c = static_cast<hpcache_decoder::op_ctx *>(userdata);
-    c->decoder->publish(ggml_custom_get_backend_stream(dst), c->il, dst->src[0], dst->src[1], dst->src[2]);
+    c->decoder->publish(custom_get_stream(dst), c->il, dst->src[0], dst->src[1], dst->src[2]);
 }
 
 static void remap_ids_cb(ggml_tensor * dst, int, int, void * userdata) {
     auto * c = static_cast<hpcache_decoder::op_ctx *>(userdata);
-    hpcache_cuda_remap_ids(ggml_custom_get_backend_stream(dst), (const int32_t *) dst->src[0]->data, c->table,
+    hpcache_cuda_remap_ids(custom_get_stream(dst), (const int32_t *) dst->src[0]->data, c->table,
             (int) dst->ne[0], c->miss_id, (int32_t *) dst->data);
 }
 
 static void remap_w_cb(ggml_tensor * dst, int, int, void * userdata) {
     auto * c = static_cast<hpcache_decoder::op_ctx *>(userdata);
-    hpcache_cuda_remap_weights(ggml_custom_get_backend_stream(dst), (const int32_t *) dst->src[0]->data,
+    hpcache_cuda_remap_weights(custom_get_stream(dst), (const int32_t *) dst->src[0]->data,
             (const float *) dst->src[1]->data, c->table, (int) dst->ne[1], (float *) dst->data);
 }
 
 static void pcie_stage_cb(ggml_tensor * dst, int, int, void * userdata) {
     auto * c = static_cast<hpcache_decoder::op_ctx *>(userdata);
     static const bool side = getenv("HPCACHE_PCIE_SIDE") == nullptr || atoi(getenv("HPCACHE_PCIE_SIDE")) != 0;
-    hpcache_cuda_pcie_stage(ggml_custom_get_backend_stream(dst), (const int32_t *) dst->src[0]->data, c->table,
+    hpcache_cuda_pcie_stage(custom_get_stream(dst), (const int32_t *) dst->src[0]->data, c->table,
             (int) dst->src[0]->ne[0], c->n_expert, c->pcie_m, c->pcie_frac, c->decoder->gtab_dev, *c->stage, side);
 }
 
 static void pcie_join_cb(ggml_tensor * dst, int, int, void *) {
     static const bool side = getenv("HPCACHE_PCIE_SIDE") == nullptr || atoi(getenv("HPCACHE_PCIE_SIDE")) != 0;
     if (side) {
-        hpcache_cuda_pcie_stage_join(ggml_custom_get_backend_stream(dst));
+        hpcache_cuda_pcie_stage_join(custom_get_stream(dst));
     }
 }
 
 static void pcie_ids_cb(ggml_tensor * dst, int, int, void * userdata) {
     auto * c = static_cast<hpcache_decoder::op_ctx *>(userdata);
-    hpcache_cuda_pcie_select(ggml_custom_get_backend_stream(dst), (const int32_t *) dst->src[0]->data, nullptr, c->table,
+    hpcache_cuda_pcie_select(custom_get_stream(dst), (const int32_t *) dst->src[0]->data, nullptr, c->table,
             (int) dst->src[0]->ne[0], c->n_expert, (int) dst->ne[0], c->pcie_frac, c->decoder->gtab_dev, (int32_t *) dst->data, nullptr);
 }
 
 static void pcie_w_cb(ggml_tensor * dst, int, int, void * userdata) {
     auto * c = static_cast<hpcache_decoder::op_ctx *>(userdata);
-    hpcache_cuda_pcie_select(ggml_custom_get_backend_stream(dst), (const int32_t *) dst->src[0]->data,
+    hpcache_cuda_pcie_select(custom_get_stream(dst), (const int32_t *) dst->src[0]->data,
             (const float *) dst->src[1]->data, c->table, (int) dst->src[0]->ne[0], c->n_expert, (int) dst->ne[1],
             c->pcie_frac, c->decoder->gtab_dev, nullptr, (float *) dst->data);
 }
 
 static void wait_merge_cb(ggml_tensor * dst, int, int, void * userdata) {
     auto * c = static_cast<hpcache_decoder::op_ctx *>(userdata);
-    c->decoder->wait_merge(ggml_custom_get_backend_stream(dst), dst);
+    c->decoder->wait_merge(custom_get_stream(dst), dst);
 }
 
 #ifdef HPCACHE_EVENT_LOG
 static void stamp_cb(ggml_tensor * dst, int, int, void * userdata) {
     auto * c = static_cast<hpcache_decoder::op_ctx *>(userdata);
-    c->decoder->stamp(ggml_custom_get_backend_stream(dst), c->stamp_event, c->il);
+    c->decoder->stamp(custom_get_stream(dst), c->stamp_event, c->il);
 }
 
 static void stamp_g2_cb(ggml_tensor * dst, int, int, void * userdata) {
     auto * c = static_cast<hpcache_decoder::op_ctx *>(userdata);
-    c->decoder->stamp_g2(ggml_custom_get_backend_stream(dst), c);
+    c->decoder->stamp_g2(custom_get_stream(dst), c);
 }
 
 void hpcache_decoder::stamp(void * s, int event, int il) {
@@ -1912,7 +1935,7 @@ void hpcache_decoder::steps_calibrate() {
 
 static void g2_finish_cb(ggml_tensor * dst, int, int, void * userdata) {
     auto * c = static_cast<hpcache_decoder::op_ctx *>(userdata);
-    c->decoder->g2_finish(ggml_custom_get_backend_stream(dst), dst, c);
+    c->decoder->g2_finish(custom_get_stream(dst), dst, c);
 }
 
 void hpcache_decoder::g2_finish(void * s, const ggml_tensor * dst, const op_ctx * c) {
