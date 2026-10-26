@@ -384,6 +384,73 @@ static __global__ void mul_mat_vec_f(
     }
 }
 
+// Short rows: one warp per output row and several rows per block. The one-block-per-row kernel above spends its time on block
+// scheduling and the shared-memory reduction when a row is only a few hundred elements long (10240 blocks of 160 threads for a
+// 320 x 10240 matrix). The sums are added in the order of mul_mat_vec_f, so the result is bit for bit the same. For ncols <= 512 that kernel runs
+// a block of nw*32 threads (nw = ceil(ncols/64)), every thread holds at most one pair of the row, each warp is summed with the xor
+// tree, the nw sums go to the lanes 0..nw-1 of one warp (the other lanes hold 0) and are summed with the xor tree again. Here one warp
+// does that for a whole row: it reduces its nw chunks of 32 pairs one after the other with the same tree.
+template <typename T, int warps_per_block, int nw>
+static __global__ void mul_mat_vec_f_short(
+        const T * x_ptr, const float * y_ptr, float * dst_ptr,
+        const int ncols2, const int nrows, const int stride_row,
+        const uint3 channel_ratio, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
+        const uint3 sample_ratio, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    const int lane = threadIdx.x % warp_size;
+    const int row  = blockIdx.x * warps_per_block + threadIdx.x / warp_size;
+
+    ggml_cuda_pdl_sync();
+    if (row >= nrows) {
+        return;
+    }
+
+    const int channel_dst = blockIdx.y;
+    const int sample_dst  = blockIdx.z;
+    const int channel_x   = fastdiv((uint32_t) channel_dst, channel_ratio);
+    const int sample_x    = fastdiv((uint32_t) sample_dst, sample_ratio);
+
+    const T * x   = x_ptr + int64_t(sample_x)*stride_sample_x + channel_x*stride_channel_x + int64_t(row)*stride_row;
+    const float2 * y2 = (const float2 *) (y_ptr + int64_t(sample_dst)*stride_sample_y + channel_dst*stride_channel_y);
+    float * dst = dst_ptr + int64_t(sample_dst)*stride_sample_dst + channel_dst*stride_channel_dst;
+
+    // all the loads first, so that they are in flight together
+    float2 xv[nw];
+    float2 yv[nw];
+#pragma unroll
+    for (int w = 0; w < nw; ++w) {
+        const int col2 = w*warp_size + lane;
+        xv[w] = make_float2(0.0f, 0.0f);
+        yv[w] = make_float2(0.0f, 0.0f);
+        if (col2 < ncols2) {
+            if constexpr (std::is_same_v<T, float>) {
+                xv[w] = ((const float2 *) x)[col2];
+            } else {
+                const nv_bfloat162 t = ((const nv_bfloat162 *) x)[col2];
+                xv[w] = make_float2(__bfloat162float(t.x), __bfloat162float(t.y));
+            }
+            yv[w] = y2[col2];
+        }
+    }
+
+    ggml_cuda_pdl_lc();
+    float fin  = 0.0f;
+    float last = 0.0f;
+#pragma unroll
+    for (int w = 0; w < nw; ++w) {
+        float sum = 0.0f;
+        sum = fmaf(xv[w].x, yv[w].x, sum);
+        sum = fmaf(xv[w].y, yv[w].y, sum);
+        sum = warp_reduce_sum<warp_size>(sum);
+        last = sum;
+        fin  = lane == w ? sum : fin;
+    }
+    const float res = nw > 1 ? warp_reduce_sum<warp_size>(fin) : last;
+    if (lane == 0) {
+        dst[row] = res;
+    }
+}
+
 template<typename T, typename type_acc, int ncols_dst, int block_size, bool is_multi_token_id = false>
 static void mul_mat_vec_f_switch_fusion(
         const T * x, const float * y, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
@@ -451,6 +518,36 @@ void launch_mul_mat_vec_f_cuda(
     }
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
+
+    // many short rows (the up projections of the hyper-connections, 320 x 10240): see mul_mat_vec_f_short
+    if constexpr (ncols_dst == 1 && !is_multi_token_id && (std::is_same_v<T, float> || std::is_same_v<T, nv_bfloat16>)) {
+        static const bool short_rows_enabled = getenv("GGML_CUDA_MMVF_NO_SHORT") == nullptr;
+        if (short_rows_enabled && ids == nullptr && !has_fusion && ncols <= 512 && nrows >= 2048 && warp_size == 32) {
+            constexpr int warps_per_block = 4;
+            const dim3 block_nums_s((nrows + warps_per_block - 1) / warps_per_block, nchannels_dst, nsamples_or_ntokens);
+            const dim3 block_dims_s(warps_per_block * warp_size, 1, 1);
+            const ggml_cuda_kernel_launch_params launch_params_s = {block_nums_s, block_dims_s, 0, stream};
+            // nw: the number of 32-thread chunks of a row, the block size mul_mat_vec_f would use
+            const auto launch_short = [&](auto nw_c) {
+                constexpr int nw = decltype(nw_c)::value;
+                ggml_cuda_kernel_launch(mul_mat_vec_f_short<T, warps_per_block, nw>, launch_params_s,
+                    x, y, dst, int(ncols/2), int(nrows), int(stride_row),
+                    channel_ratio_fd, int(stride_channel_x), int(stride_channel_y), int(stride_channel_dst),
+                    sample_ratio_fd, int(stride_sample_x), int(stride_sample_y), int(stride_sample_dst));
+            };
+            switch ((ncols/2 + warp_size - 1) / warp_size) {
+                case 1: launch_short(std::integral_constant<int, 1>()); return;
+                case 2: launch_short(std::integral_constant<int, 2>()); return;
+                case 3: launch_short(std::integral_constant<int, 3>()); return;
+                case 4: launch_short(std::integral_constant<int, 4>()); return;
+                case 5: launch_short(std::integral_constant<int, 5>()); return;
+                case 6: launch_short(std::integral_constant<int, 6>()); return;
+                case 7: launch_short(std::integral_constant<int, 7>()); return;
+                case 8: launch_short(std::integral_constant<int, 8>()); return;
+                default: break;
+            }
+        }
+    }
 
     const int nbytes_shared = warp_size*sizeof(float) + (has_fusion ? warp_size*sizeof(float) : 0);
     const dim3 block_nums(nrows, nchannels_dst, nsamples_or_ntokens);
