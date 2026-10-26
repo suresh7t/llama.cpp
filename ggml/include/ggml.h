@@ -2813,15 +2813,6 @@ extern "C" {
             int                   n_tasks,
             void                * userdata);
 
-    // run a custom op on the native stream of a backend that has one (CUDA)
-    // fun is called with ith = 0 and nth = 1, and n_tasks must be 1
-    // backends without this support report the op as unsupported and the scheduler uses the CPU
-    GGML_API void ggml_custom_set_backend_stream(struct ggml_tensor * tensor);
-
-    // native stream of the backend that runs the custom op, NULL when there is none
-    // valid only inside fun
-    GGML_API void * ggml_custom_get_backend_stream(const struct ggml_tensor * tensor);
-
     // loss function
 
     GGML_API struct ggml_tensor * ggml_cross_entropy_loss(

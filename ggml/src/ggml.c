@@ -6261,26 +6261,6 @@ struct ggml_tensor * ggml_custom_inplace(
 
     return result;
 }
-
-void ggml_custom_set_backend_stream(struct ggml_tensor * tensor) {
-    GGML_ASSERT(tensor->op == GGML_OP_CUSTOM);
-
-    struct ggml_custom_op_params params;
-    memcpy(&params, tensor->op_params, sizeof(params));
-    GGML_ASSERT(params.n_tasks == 1);
-
-    params.flags |= GGML_CUSTOM_OP_FLAG_BACKEND_STREAM;
-    ggml_set_op_params(tensor, &params, sizeof(params));
-}
-
-void * ggml_custom_get_backend_stream(const struct ggml_tensor * tensor) {
-    GGML_ASSERT(tensor->op == GGML_OP_CUSTOM);
-
-    struct ggml_custom_op_params params;
-    memcpy(&params, tensor->op_params, sizeof(params));
-    return params.stream;
-}
-
 // ggml_cross_entropy_loss
 
 struct ggml_tensor * ggml_cross_entropy_loss(
