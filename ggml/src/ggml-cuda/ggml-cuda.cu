@@ -2207,6 +2207,29 @@ static void ggml_cuda_op_custom(ggml_backend_cuda_context & ctx, ggml_tensor * d
     params.fun(dst, 0, 1, params.userdata);
 }
 
+// Exported through the registry (ggml_backend_cuda_custom_set_stream, ggml_backend_cuda_custom_get_stream) for a MoE
+// provider whose custom ops enqueue work on the stream of this backend.
+// set: run a GGML_OP_CUSTOM tensor on the stream of the backend, fun is called with ith = 0 and nth = 1, n_tasks must be 1.
+static void ggml_backend_cuda_custom_set_stream(ggml_tensor * tensor) {
+    GGML_ASSERT(tensor->op == GGML_OP_CUSTOM);
+
+    ggml_custom_op_params params;
+    memcpy(&params, tensor->op_params, sizeof(params));
+    GGML_ASSERT(params.n_tasks == 1);
+
+    params.flags |= GGML_CUSTOM_OP_FLAG_BACKEND_STREAM;
+    memcpy(tensor->op_params, &params, sizeof(params));
+}
+
+// get: the cudaStream_t the op runs on, valid only inside fun
+static void * ggml_backend_cuda_custom_get_stream(const ggml_tensor * tensor) {
+    GGML_ASSERT(tensor->op == GGML_OP_CUSTOM);
+
+    ggml_custom_op_params params;
+    memcpy(&params, tensor->op_params, sizeof(params));
+    return params.stream;
+}
+
 static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
     switch (dst->op) {
         case GGML_OP_CUSTOM:
@@ -6086,6 +6109,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
+    }
+    if (strcmp(name, "ggml_backend_cuda_custom_set_stream") == 0) {
+        return (void *)ggml_backend_cuda_custom_set_stream;
+    }
+    if (strcmp(name, "ggml_backend_cuda_custom_get_stream") == 0) {
+        return (void *)ggml_backend_cuda_custom_get_stream;
     }
     return nullptr;
 }
