@@ -3002,12 +3002,22 @@ static void ggml_cuda_graph_update_executable(cudaGraphExec_t & instance, cudaGr
 }
 
 // number of ggml nodes per CUDA graph chunk, 0 captures the whole ggml graph as one CUDA graph
-static int ggml_cuda_graph_chunk_size() {
+static int ggml_cuda_graph_chunk_size_env() {
     static const int chunk_size = [] {
         const char * env = getenv("GGML_CUDA_GRAPH_CHUNK_SIZE");
         return env != nullptr ? atoi(env) : 512;
     }();
     return chunk_size;
+}
+
+// custom ops run on their own streams and join in a later node, a cut in between would end the capture with unjoined work
+static int ggml_cuda_graph_chunk_size(const ggml_cgraph * cgraph) {
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        if (cgraph->nodes[i]->op == GGML_OP_CUSTOM) {
+            return 0;
+        }
+    }
+    return ggml_cuda_graph_chunk_size_env();
 }
 
 // end the capture of chunk `idx`, update or create its executable and launch it
@@ -4799,7 +4809,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
 #ifdef USE_CUDA_GRAPH
     ggml_cuda_graph * graph      = use_cuda_graph ? cuda_ctx->cuda_graph(graph_key) : nullptr;
-    const int         chunk_size = ggml_cuda_graph_chunk_size();
+    const int         chunk_size = ggml_cuda_graph_chunk_size(cgraph);
     int               chunk_end  = chunk_size;
     size_t            n_chunks   = 0;
 #endif // USE_CUDA_GRAPH
