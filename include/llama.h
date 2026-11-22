@@ -362,6 +362,10 @@ extern "C" {
         // optional MoE provider that replaces expert placement and scheduling, NULL uses the defaults
         // the provider must outlive the model
         const struct llama_moe_provider_api * moe_provider;
+
+        // optional provider that is asked only to build the output head (llama_moe_provider_api::build_output), for a model that
+        // does not take the placement and scheduling hooks, such as the draft model of MTP; NULL uses moe_provider
+        const struct llama_moe_provider_api * moe_output_provider;
     };
 
     struct llama_sampler_seq_config {

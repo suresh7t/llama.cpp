@@ -51,10 +51,18 @@ public:
     // y = sum_i w[i] * down_{ids[i]}(act(gate_{ids[i]}(x), up_{ids[i]}(x))), m <= 32 experts
     void run(const hpcache_expert_desc & d, const float * x, const int32_t * ids, const float * w, int m, float * y);
 
+    // The experts of several tokens: x holds n_tok rows of n_embd. The routed (token, expert) pairs are grouped by expert:
+    // group g is the expert ids[g] and the pairs g_first[g] .. g_first[g + 1] - 1, each with its token and router weight.
+    // The rows of an expert are read once for all the tokens that routed to it. y holds n_tok rows, a token without
+    // pairs gets zeros. n_tok <= 32.
+    void run_multi(const hpcache_expert_desc & d, const float * x, int n_tok, const int32_t * ids, const int32_t * g_first,
+            int n_groups, const int32_t * p_tok, const float * p_w, float * y);
+
 private:
     struct task;
     void worker(int ith);
     void execute(task & t, int ith);
+    void execute_multi(task & t, int ith);
     void barrier();
 
     int n_threads;

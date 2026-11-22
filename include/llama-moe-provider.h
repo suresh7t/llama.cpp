@@ -13,7 +13,7 @@
 extern "C" {
 #endif
 
-#define LLAMA_MOE_ABI_VERSION 1
+#define LLAMA_MOE_ABI_VERSION 2
 
 struct llama_model;
 
@@ -91,6 +91,22 @@ struct llama_moe_layer_request {
 };
 
 //
+// output head
+//
+
+struct llama_moe_output_request {
+    struct ggml_context * ctx;      // graph build context, new nodes go here
+    struct ggml_cgraph  * gf;
+    struct ggml_tensor  * cur;      // the normalised hidden state, [n_embd, n_tokens]
+    struct ggml_tensor  * output;   // the model's output.weight, [n_embd, n_vocab]
+    const struct llama_model * model;
+    int32_t n_embd;
+    int32_t n_vocab;
+    int32_t n_tokens;
+    int32_t is_draft_head;          // the graph of an MTP head
+};
+
+//
 // decode lifecycle
 //
 
@@ -153,7 +169,8 @@ struct llama_moe_provider_api {
     // returns the weighted sum of routed expert outputs, [n_embd, n_tokens]
     // the core adds shared experts and the residual
     // returns NULL to use the stock path
-    // the core calls this only when n_tokens == 1, without expert biases, scales or LoRA adapters
+    // the core calls this for every window that is not trimmed, without expert biases, scales or LoRA adapters;
+    // the provider returns NULL for the windows it does not take
     struct ggml_tensor * (*build_moe_layer)(void * handle, const struct llama_moe_layer_request * req);
 
     // right before the graph is submitted, must not block
@@ -165,6 +182,14 @@ struct llama_moe_provider_api {
 
     // after compute, cells [cell_begin, cell_begin + n_cells) of the KV cache were written
     void (*kv_commit)(void * handle, int32_t seq_id, int32_t cell_begin, int32_t n_cells);
+
+    // called while the graph of the output head is built (the final projection to the vocabulary, today the MTP head of
+    // qwen4exp)
+    // returns the logits, F32 [n_vocab, n_tokens], over the whole vocabulary: a provider that computes only some rows (a draft
+    // head over a subset of the tokens) fills the other entries with -INFINITY
+    // returns NULL to use the stock path
+    // set on a model through llama_model_params::moe_output_provider; a model that has only that pointer gets no other call
+    struct ggml_tensor * (*build_output)(void * handle, const struct llama_moe_output_request * req);
 
     void (*free)(void * handle);
 };

@@ -166,6 +166,9 @@ LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uin
 
 LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 
+// the MoE provider of the model (the one in llama_model_params::moe_provider), NULL when it has none
+LLAMA_API const struct llama_moe_provider_api * llama_model_get_moe_provider(const struct llama_model * model);
+
 //
 // model/context data extraction
 //

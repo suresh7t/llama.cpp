@@ -3511,6 +3511,7 @@ llama_model_params llama_model_default_params() {
         /*.no_alloc                    =*/ false,
         /*.load_mtp                    =*/ false,
         /*.moe_provider                =*/ nullptr,
+        /*.moe_output_provider         =*/ nullptr,
     };
 
     return result;
@@ -3546,6 +3547,10 @@ int32_t llama_model_n_embd_out(const llama_model * model) {
 
 int32_t llama_model_n_layer(const llama_model * model) {
     return model->hparams.n_layer();
+}
+
+const llama_moe_provider_api * llama_model_get_moe_provider(const llama_model * model) {
+    return model->moe_provider();
 }
 
 int32_t llama_model_n_layer_nextn(const llama_model * model) {

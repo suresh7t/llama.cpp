@@ -38,6 +38,8 @@ if (GGML_CUDA)
             hpcache-cpu.h
             hpcache-decode.cpp
             hpcache-decode.h
+            hpcache-draft-head.cpp
+            hpcache-draft-head.h
         )
     endif()
 endif()

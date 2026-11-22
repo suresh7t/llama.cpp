@@ -142,12 +142,17 @@ struct hpcache_decoder::layer {
 
     // staged experts: the stage kernel copies the GPU's share from the page-locked arena into these views
     hpcache_stage_args stage;
+    // swap_kernel: device addresses of the expert tensors in the page-locked arena, one per pool tensor kind
+    int            swap_src_ok = -1;   // -1 not checked, 0 the kernel cannot read them, 1 it can
+    const char *   swap_src[4] = {};
     ggml_context * a_ctx      = nullptr;
     ggml_tensor *  a_gate     = nullptr;
     ggml_tensor *  a_up       = nullptr;
     ggml_tensor *  a_down     = nullptr;
     ggml_tensor *  a_gate_up  = nullptr;
     bool           pcie       = false;
+    bool           win_pcie   = false;   // windows of several tokens stage experts too (decided when the graph is built)
+    int            win_cap    = 0;
 
     // own CPU kernel, valid when fast
     hpcache_expert_desc   desc;
@@ -291,10 +296,11 @@ bool hpcache_decoder::init_pcie(layer & l) {
     if (n == 0 || n > 3) {
         return false;
     }
-    const int m = opts.pcie_max;
-    if (m < 1 || m > 8) {
+    if (opts.pcie_max < 1 || opts.pcie_max > 8) {
         return false;
     }
+    // slots per tensor kind: the single token path uses the first pcie_max, a window of several tokens up to pcie_win_max
+    const int m = std::max(opts.pcie_max, std::min(opts.pcie_win_max, 8));
     if (pcie_buf == nullptr) {
         // one slot size for every kind and layer: the largest tensor per expert
         pcie_slot_bytes = (arena->max_tensor_bytes() / (size_t) l.n_expert + 255) / 256 * 256;
@@ -418,6 +424,12 @@ hpcache_decoder::~hpcache_decoder() {
                 g_adm_pub * k, g_adm_sel * k, g_adm_copy * k, g_adm_up * k, g_adm_decay * k);
         log(GGML_LOG_LEVEL_INFO, buf);
     }
+    if (n_swap_launches > 0) {
+        char buf[200];
+        snprintf(buf, sizeof(buf), "swap kernel: %lld experts copied by %lld kernels, %lld by the copier (not page-locked)",
+                (long long) n_swap_kernel, (long long) n_swap_launches, (long long) n_swap_copier);
+        log(GGML_LOG_LEVEL_INFO, buf);
+    }
     if (copy_batches > 0) {
         char buf[256];
         snprintf(buf, sizeof(buf),
@@ -433,6 +445,35 @@ hpcache_decoder::~hpcache_decoder() {
         snprintf(buf, sizeof(buf), "PCIe path: %lld experts computed by the GPU from the arena, %.2f per step",
                 (long long) n_pcie_experts, double(n_pcie_experts) / double(n_decode.load()));
         log(GGML_LOG_LEVEL_INFO, buf);
+    }
+    if (n_tail_skipped > 0) {
+        char buf[200];
+        snprintf(buf, sizeof(buf), "tail skip (the output differs from the full run): %lld missed experts were not computed by the CPU",
+                (long long) n_tail_skipped);
+        log(GGML_LOG_LEVEL_INFO, buf);
+    }
+    if (n_pcie_win_windows > 0) {
+        char buf[200];
+        snprintf(buf, sizeof(buf), "PCIe path in windows of several tokens: %lld experts staged in %lld layer windows, %.2f per layer window",
+                (long long) n_pcie_win_experts, (long long) n_pcie_win_windows, double(n_pcie_win_experts) / double(n_pcie_win_windows));
+        log(GGML_LOG_LEVEL_INFO, buf);
+    }
+    if (n_dedup_pairs > 0) {
+        char buf[160];
+        snprintf(buf, sizeof(buf), "windows of several tokens: %lld expert pairs on the CPU, %lld distinct experts (%.2f tokens per expert)",
+                (long long) n_dedup_pairs, (long long) n_dedup_groups, double(n_dedup_pairs) / double(std::max<int64_t>(1, n_dedup_groups)));
+        log(GGML_LOG_LEVEL_INFO, buf);
+    }
+    for (int w = 1; w <= 8; ++w) {
+        if (pos_stat[w][0][0] == 0) { continue; }
+        std::string s = "window of " + std::to_string(w) + " tokens, pool hit / staged by position:";
+        for (int t = 0; t < w; ++t) {
+            char b[64];
+            snprintf(b, sizeof(b), " %.1f%%/%.1f%%", 100.0 * pos_stat[w][t][1] / std::max<int64_t>(1, pos_stat[w][t][0]), 100.0 * pos_stat[w][t][2] / std::max<int64_t>(1, pos_stat[w][t][0]));
+            s += b;
+        }
+        s += " (routed per position " + std::to_string(pos_stat[w][0][0]) + ")";
+        log(GGML_LOG_LEVEL_INFO, s);
     }
     if (n_routed.load() > 0) {
         char buf[256];
@@ -502,6 +543,10 @@ hpcache_decoder::~hpcache_decoder() {
         }
     }
 
+    if (swap_kernel_busy) {
+        hpcache_cuda_swap_wait();
+        swap_kernel_busy = false;
+    }
     copier_wait();
     copier_quit.store(true);
     copier_work.notify();
@@ -541,7 +586,7 @@ bool hpcache_decoder::ensure_doorbell(int n_embd, int k) {
         return db.n_embd == n_embd && db.k == k;
     }
     std::string error;
-    if (!hpcache_doorbell_init(db, n_embd, k, error)) {
+    if (!hpcache_doorbell_init(db, n_embd, k, opts.max_tokens, error)) {
         log(GGML_LOG_LEVEL_ERROR, "doorbell: " + error);
         return false;
     }
@@ -559,6 +604,10 @@ bool hpcache_decoder::ensure_doorbell(int n_embd, int k) {
 static ggml_tensor * build_experts(ggml_context * ctx, ggml_tensor * gate_up_exps, ggml_tensor * gate_exps,
         ggml_tensor * up_exps, ggml_tensor * down_exps, ggml_tensor * x, ggml_tensor * ids, ggml_tensor * w,
         int n_embd, int m, float clamp) {
+    // ids may hold -1 (miss id, unused staging slot). Only the single-column quantized matvec of ggml-cuda skips a negative
+    // id (our patch, mmvq.cu); the multi-token MoE matvec (mul_mat_vec_q_moe) would read out of bounds with it. So the
+    // expert ops are built for one token at a time: batching tokens here needs that kernel to handle -1 first.
+    GGML_ASSERT(x->ne[1] == 1 && x->ne[2] == 1 && "moe-hpcache: expert ops with negative ids must be one token");
     ggml_tensor * gate = nullptr;
     ggml_tensor * up   = nullptr;
     if (gate_up_exps != nullptr) {
@@ -785,7 +834,15 @@ void hpcache_decoder::init_pool(const llama_moe_layer_request & req) {
         ggml_backend_dev_memory(pool_dev, &free_bytes, &total_bytes);
     }
 
-    size_t budget = free_bytes > opts.reserve_bytes ? free_bytes - opts.reserve_bytes : 0;
+    // When the process holds more than the OS budget of the card, WDDM pages the allocations that are idle between uses (a draft
+    // head, for one) out to system memory, and their kernels then read through PCIe: the MTP head ran 20 times slower.
+    // The draft head of MTP loads after the pool is sized: its weights, KV cache and compute buffers need about 3 GiB. With 1.5 GiB
+    // left its expert kernels still ran 20 times slower (1650 us against 85 us); with 3 GiB they run at the speed of stock llama.cpp.
+    // A pool smaller by 1.5 to 3 GiB costs about one point of hit rate and no speed without MTP.
+    const size_t headroom = opts.headroom_bytes != SIZE_MAX ? opts.headroom_bytes : std::min<size_t>(size_t(3072) << 20, total_bytes / 5);
+    pool_headroom = headroom;
+    const size_t reserve_all = opts.reserve_bytes + headroom;
+    size_t budget = free_bytes > reserve_all ? free_bytes - reserve_all : 0;
     if (opts.pool_bytes > 0) {
         budget = std::min(budget, opts.pool_bytes);
     } else if (opts.plan_bytes > 0) {
@@ -1149,7 +1206,7 @@ void hpcache_decoder::grow_pool() {
     size_t free_bytes = 0, total_bytes = 0;
     device_free_bytes(free_bytes, total_bytes);
 
-    const size_t keep = opts.grow_margin_bytes;
+    const size_t keep = std::max(opts.grow_margin_bytes, pool_headroom);   // growing must not eat the headroom again
     if (free_bytes <= keep) {
         char msg[200];
         snprintf(msg, sizeof(msg), "GPU expert pool not grown: %.0f MiB free, the margin needs %.0f MiB",
@@ -1384,6 +1441,81 @@ void hpcache_decoder::copier_wait() {
     copier_done.wait_until([&] { return !copier_busy.load(); });
 }
 
+// the device addresses of a layer's expert tensors in the arena, when they are page-locked, mapped and 16-byte aligned
+bool hpcache_decoder::swap_sources(layer & l) {
+    if (l.swap_src_ok >= 0) {
+        return l.swap_src_ok == 1;
+    }
+    l.swap_src_ok = 0;
+    if (!arena) {
+        return false;
+    }
+    const ggml_tensor * src[4] = { l.t_gate, l.t_up, l.t_down, l.t_gate_up };
+    const ggml_tensor * dst[4] = { l.p_gate, l.p_up, l.p_down, l.p_gate_up };
+    for (int t = 0; t < 4; ++t) {
+        if (src[t] == nullptr) {
+            continue;
+        }
+        if (dst[t] == nullptr || src[t]->data == nullptr || !arena->is_pinned(src[t]->data, ggml_nbytes(src[t])) ||
+                reinterpret_cast<uintptr_t>(src[t]->data) % 16 != 0 || reinterpret_cast<uintptr_t>(dst[t]->data) % 16 != 0 ||
+                src[t]->nb[2] % 16 != 0 || src[t]->nb[2] != dst[t]->nb[2]) {
+            return false;
+        }
+        const int prev = hpcache_cuda_get_device();
+        if (pool_device_index >= 0) {
+            hpcache_cuda_set_device(pool_device_index);   // the mapping is per device
+        }
+        void * dev = hpcache_cuda_host_device_ptr(src[t]->data);
+        hpcache_cuda_set_device(prev);
+        if (dev == nullptr) {
+            return false;
+        }
+        l.swap_src[t] = static_cast<const char *>(dev);
+    }
+    l.swap_src_ok = 1;
+    return true;
+}
+
+void hpcache_decoder::submit_swaps(const std::vector<pending_swap> & jobs) {
+    if (!opts.swap_kernel) {
+        n_swap_copier += (int64_t) jobs.size();
+        copier_submit(jobs);
+        return;
+    }
+    std::vector<pending_swap> rest;
+    std::vector<hpcache_swap_copy> copies;
+    for (const pending_swap & j : jobs) {
+        layer & l = *j.l;
+        if (!swap_sources(l)) {
+            rest.push_back(j);
+            continue;
+        }
+        const ggml_tensor * dst[4] = { l.p_gate, l.p_up, l.p_down, l.p_gate_up };
+        for (int t = 0; t < 4; ++t) {
+            if (l.swap_src[t] == nullptr) {
+                continue;
+            }
+            const size_t n = dst[t]->nb[2];
+            copies.push_back({ l.swap_src[t] + size_t(j.expert) * n, static_cast<char *>(dst[t]->data) + size_t(j.slot) * n, n });
+        }
+    }
+    if (!copies.empty()) {
+        if (hpcache_cuda_swap_copy(pool_device_index, copies.data(), (int) copies.size())) {
+            swap_kernel_busy = true;
+            ++n_swap_launches;
+            n_swap_kernel += (int64_t) (jobs.size() - rest.size());
+        } else {
+            log(GGML_LOG_LEVEL_WARN, "swap kernel: launch failed, the copier takes the swaps from now on");
+            opts.swap_kernel = false;
+            rest = jobs;
+        }
+    }
+    if (!rest.empty()) {
+        n_swap_copier += (int64_t) rest.size();
+        copier_submit(rest);
+    }
+}
+
 // map the experts whose copies were queued by the previous round
 void hpcache_decoder::publish_pending() {
     if (pending.empty()) {
@@ -1391,8 +1523,12 @@ void hpcache_decoder::publish_pending() {
     }
     {
         const int64_t w0 = adm_now();
-        const bool blocked = copier_busy.load();
+        const bool blocked = copier_busy.load() || (swap_kernel_busy && !hpcache_cuda_swap_done());
         copier_wait();
+        if (swap_kernel_busy) {
+            hpcache_cuda_swap_wait();
+            swap_kernel_busy = false;
+        }
         const int64_t w_us = adm_now() - w0;
         ++pub_waits;
         pub_blocked += blocked ? 1 : 0;
@@ -1590,6 +1726,7 @@ static void remap_w_cb(ggml_tensor * dst, int, int, void * userdata);
 static void pcie_stage_cb(ggml_tensor * dst, int, int, void * userdata);
 static void pcie_join_cb(ggml_tensor * dst, int, int, void * userdata);
 static void pcie_ids_cb(ggml_tensor * dst, int, int, void * userdata);
+static void pcie_stage_win_cb(ggml_tensor * dst, int, int, void * userdata);
 static void pcie_w_cb(ggml_tensor * dst, int, int, void * userdata);
 static void wait_merge_cb(ggml_tensor * dst, int, int, void * userdata);
 #ifdef HPCACHE_EVENT_LOG
@@ -1597,7 +1734,8 @@ static void stamp_cb(ggml_tensor * dst, int, int, void * userdata);
 #endif
 
 ggml_tensor * hpcache_decoder::build_layer(const llama_moe_layer_request & req) {
-    if (!ok() || !cuda_stream_api() || req.ffn_op != LLAMA_MOE_FFN_SILU || req.n_tokens != 1 || req.down_exps == nullptr ||
+    if (!ok() || !cuda_stream_api() || req.ffn_op != LLAMA_MOE_FFN_SILU || req.n_tokens < 1 || req.n_tokens > opts.max_tokens ||
+            (req.n_tokens > 1 && opts.gpu2) || req.down_exps == nullptr ||
             (req.gate_exps == nullptr && req.gate_up_exps == nullptr) ||
             (req.gate_up_exps == nullptr && req.up_exps == nullptr) || req.n_expert_used > 32) {
         return nullptr;
@@ -1641,9 +1779,26 @@ ggml_tensor * hpcache_decoder::build_layer(const llama_moe_layer_request & req) 
 
     HPCACHE_TRACE("build layer %d, k=%d, n_embd=%d, pool slots %d", req.il, k, n_embd, l->n_slots);
 
+    // a window of several tokens: the experts of each token run as the single token does, the PCIe path is not used
+    const bool multi = req.n_tokens > 1;
+    const bool use_pcie = l->pcie && !multi;
+    // the PCIe path for a window of several tokens: one set of staged experts for the window
+    static const bool pcie_multi_env = [] { const char * e = getenv("HPCACHE_PCIE_MULTI"); return e == nullptr || atoi(e) != 0; }();
+    bool use_win_pcie = l->pcie && multi && opts.pcie_multi && pcie_multi_env && l->n_slots > 0 && req.n_expert <= 1024;
+    if (use_win_pcie && d_stage_table == nullptr) {
+        std::vector<int32_t> neg(1024, -1);
+        d_stage_table = (int32_t *) hpcache_cuda_upload(pool_device_index >= 0 ? pool_device_index : hpcache_cuda_get_device(),
+                neg.data(), neg.size() * sizeof(int32_t));
+        stage_table_n = d_stage_table != nullptr ? 1024 : 0;
+    }
+    use_win_pcie = use_win_pcie && d_stage_table != nullptr;
+    l->win_pcie = use_win_pcie;
+    l->win_cap  = use_win_pcie ? std::min(std::min(opts.pcie_win_max, 8), 32) : 0;
+
     op_ctx octx = { this, req.il, l->d_table };
     octx.n_expert = req.n_expert;
-    // ggml-cuda skips negative expert ids in the quantized matvec (mmvq.cu), so a missed expert costs nothing
+    // ggml-cuda skips negative expert ids in the quantized matvec (mmvq.cu), so a missed expert costs nothing.
+    // Only the single-column kernel does (our patch); build_experts asserts that every expert op is one token.
     static const bool skip_miss = [] { const char * e = getenv("HPCACHE_SKIP_MISS"); return e == nullptr || atoi(e) != 0; }();
     if (skip_miss && l->n_slots > 0) {
         bool quantized = true;
@@ -1654,7 +1809,7 @@ ggml_tensor * hpcache_decoder::build_layer(const llama_moe_layer_request & req) 
             octx.miss_id = -1;
         }
     }
-    if (l->pcie) {
+    if (use_pcie) {
         octx.pcie_m = std::min(opts.pcie_max, (int) req.n_expert_used);
         octx.pcie_frac = db.d_frac;
         octx.stage = &l->stage;
@@ -1667,7 +1822,7 @@ ggml_tensor * hpcache_decoder::build_layer(const llama_moe_layer_request & req) 
     custom_set_stream(pub);
 
     ggml_tensor * wait_src[1] = { pub };
-    ggml_tensor * merged = ggml_custom_4d(req.ctx, GGML_TYPE_F32, n_embd, 1, 1, 1, wait_src, 1, wait_merge_cb, 1, ud);
+    ggml_tensor * merged = ggml_custom_4d(req.ctx, GGML_TYPE_F32, n_embd, req.n_tokens, 1, 1, wait_src, 1, wait_merge_cb, 1, ud);
     custom_set_stream(merged);
 
 #ifdef HPCACHE_EVENT_LOG
@@ -1737,7 +1892,7 @@ ggml_tensor * hpcache_decoder::build_layer(const llama_moe_layer_request & req) 
     // its own right after the ring, and the pool experts below are queued ahead of the join, so they compute while it copies.
     // The ops that read the fetched experts come after the pool experts, below.
     ggml_tensor * stg = nullptr;
-    if (l->pcie) {
+    if (use_pcie) {
         ggml_tensor * ssrc[2] = { req.selected_experts, pub };
         stg = ggml_custom_4d(req.ctx, GGML_TYPE_F32, 1, 1, 1, 1, ssrc, 2, pcie_stage_cb, 1, ud);
         custom_set_stream(stg);
@@ -1765,6 +1920,69 @@ ggml_tensor * hpcache_decoder::build_layer(const llama_moe_layer_request & req) 
             return finish(pcie_out, ggml_add(req.ctx, pcie_out, ggml_reshape_2d(req.ctx, merged, n_embd, 1)));
         }
         return finish(nullptr, merged);
+    }
+
+    if (multi) {
+        // one lane per token: its ids and weights are rows of the window, its experts in the pool run on the GPU
+        ggml_tensor * all = nullptr;
+        // the window's staged experts: one fetch for the window, queued on a stream of its own before the pool experts
+        ggml_tensor * stg_w = nullptr;
+        void * ud_win = nullptr;
+        void * ud_stg = nullptr;
+        if (use_win_pcie) {
+            op_ctx sc = octx;
+            sc.stage = &l->stage;
+            sc.stage_table = d_stage_table;
+            sc.win_cap = l->win_cap;
+            op_ctxs.push_back(sc);
+            ud_win = &op_ctxs.back();
+            op_ctx rc = octx;
+            rc.table = d_stage_table;   // the remap ops read the table of the staged experts instead of the pool table
+            op_ctxs.push_back(rc);
+            ud_stg = &op_ctxs.back();
+            ggml_tensor * ssrc[2] = { req.selected_experts, pub };
+            stg_w = ggml_custom_4d(req.ctx, GGML_TYPE_F32, 1, 1, 1, 1, ssrc, 2, pcie_stage_win_cb, 1, ud_win);
+            custom_set_stream(stg_w);
+        }
+        for (int t = 0; t < req.n_tokens; ++t) {
+            ggml_tensor * ids_t = ggml_view_1d(req.ctx, req.selected_experts, k, size_t(t) * req.selected_experts->nb[1]);
+            ggml_tensor * w_t   = ggml_view_1d(req.ctx, req.weights, k, size_t(t) * req.weights->nb[2]);
+            ggml_tensor * ids_in[3] = { ids_t, pub, stg_w };
+            ggml_tensor * ids_hit = ggml_custom_4d(req.ctx, GGML_TYPE_I32, k, 1, 1, 1, ids_in,
+                    (t == 0 && stg_w != nullptr) ? 3 : 2, remap_ids_cb, 1, ud);
+            custom_set_stream(ids_hit);
+            ggml_tensor * w_in[3] = { ids_t, w_t, pub };
+            ggml_tensor * w_hit = ggml_custom_4d(req.ctx, GGML_TYPE_F32, 1, k, 1, 1, w_in, 3, remap_w_cb, 1, ud);
+            custom_set_stream(w_hit);
+            ggml_tensor * x_t = ggml_view_3d(req.ctx, req.cur, n_embd, 1, 1, req.cur->nb[1], req.cur->nb[1], size_t(t) * req.cur->nb[1]);
+            ggml_tensor * hit_t = build_experts(req.ctx, l->p_gate_up, l->p_gate, l->p_up, l->p_down, x_t, ids_hit, w_hit,
+                    n_embd, k, req.swiglu_clamp);
+            all = all == nullptr ? hit_t : ggml_concat(req.ctx, all, hit_t, 1);
+        }
+        if (use_win_pcie) {
+            // the staged experts of the window: each token computes the ones it routed to, after the pool experts
+            ggml_tensor * jsrc[2] = { stg_w, all };
+            ggml_tensor * stj = ggml_custom_4d(req.ctx, GGML_TYPE_F32, 1, 1, 1, 1, jsrc, 2, pcie_join_cb, 1, ud_win);
+            custom_set_stream(stj);
+            ggml_tensor * pall = nullptr;
+            for (int t = 0; t < req.n_tokens; ++t) {
+                ggml_tensor * ids_t = ggml_view_1d(req.ctx, req.selected_experts, k, size_t(t) * req.selected_experts->nb[1]);
+                ggml_tensor * w_t   = ggml_view_1d(req.ctx, req.weights, k, size_t(t) * req.weights->nb[2]);
+                ggml_tensor * pids_in[2] = { ids_t, stj };
+                ggml_tensor * p_ids = ggml_custom_4d(req.ctx, GGML_TYPE_I32, k, 1, 1, 1, pids_in, 2, remap_ids_cb, 1, ud_stg);
+                custom_set_stream(p_ids);
+                ggml_tensor * pw_in[3] = { ids_t, w_t, stj };
+                ggml_tensor * p_w = ggml_custom_4d(req.ctx, GGML_TYPE_F32, 1, k, 1, 1, pw_in, 3, remap_w_cb, 1, ud_stg);
+                custom_set_stream(p_w);
+                ggml_tensor * x_t = ggml_view_3d(req.ctx, req.cur, n_embd, 1, 1, req.cur->nb[1], req.cur->nb[1], size_t(t) * req.cur->nb[1]);
+                ggml_tensor * pe_t = build_experts(req.ctx, l->a_gate_up, l->a_gate, l->a_up, l->a_down, x_t, p_ids, p_w,
+                        n_embd, k, req.swiglu_clamp);
+                pall = pall == nullptr ? pe_t : ggml_concat(req.ctx, pall, pe_t, 1);
+            }
+            all = ggml_add(req.ctx, all, pall);
+        }
+        // the GPU part is the first operand, so it is queued before the wait
+        return finish(all, ggml_add(req.ctx, all, merged));
     }
 
     // experts in the pool run on the GPU while the CPU serves the rest
@@ -1801,7 +2019,11 @@ void hpcache_decoder::publish(void * s, int il, const ggml_tensor * x, const ggm
     // the GPU waits for the follower after this ring, so it must be running whatever the caller did
     arm();
     HPCACHE_TRACE("publish layer %d, stream %p", il, s);
-    hpcache_cuda_publish(s, db, (const float *) x->data, (const int32_t *) ids->data, (const float *) w->data, il);
+    const int n_tokens = (int) x->ne[1];
+    GGML_ASSERT(n_tokens <= db.max_tokens && x->nb[0] == sizeof(float) && ids->nb[0] == sizeof(int32_t) &&
+            (n_tokens == 1 || w->nb[1] == sizeof(float)));
+    hpcache_cuda_publish(s, db, (const float *) x->data, (const int32_t *) ids->data, (const float *) w->data, il, n_tokens,
+            (int) (x->nb[1] / sizeof(float)), (int) (ids->nb[1] / sizeof(int32_t)), (int) (w->nb[2] / sizeof(float)));
 }
 
 void hpcache_decoder::wait_merge(void * s, ggml_tensor * dst) {
@@ -1809,7 +2031,7 @@ void hpcache_decoder::wait_merge(void * s, ggml_tensor * dst) {
         GGML_ABORT("moe-hpcache: the wait op ran on a backend without a stream");
     }
     HPCACHE_TRACE("wait_merge enqueued");
-    hpcache_cuda_wait_merge(s, db, (float *) dst->data);
+    hpcache_cuda_wait_merge(s, db, (float *) dst->data, (int) dst->ne[1]);
 }
 
 static void publish_cb(ggml_tensor * dst, int, int, void * userdata) {
@@ -1829,11 +2051,42 @@ static void remap_w_cb(ggml_tensor * dst, int, int, void * userdata) {
             (const float *) dst->src[1]->data, c->table, (int) dst->ne[1], (float *) dst->data);
 }
 
+// The staging slots past the staged experts: when the expert ops skip them (miss id -1, quantized pool), the select ops
+// write id -1 for them and the stage kernels do not zero them. HPCACHE_STAGE_ZERO=1 keeps the old way (index, weight 0,
+// zeroed slot) for comparison. All three ops of a layer must agree, so they all ask here.
+static bool stage_skip_unused(const hpcache_decoder::op_ctx * c) {
+    static const bool force_zero = getenv("HPCACHE_STAGE_ZERO") != nullptr && atoi(getenv("HPCACHE_STAGE_ZERO")) != 0;
+    return !force_zero && c->miss_id < 0;
+}
+
 static void pcie_stage_cb(ggml_tensor * dst, int, int, void * userdata) {
     auto * c = static_cast<hpcache_decoder::op_ctx *>(userdata);
     static const bool side = getenv("HPCACHE_PCIE_SIDE") == nullptr || atoi(getenv("HPCACHE_PCIE_SIDE")) != 0;
     hpcache_cuda_pcie_stage(custom_get_stream(dst), (const int32_t *) dst->src[0]->data, c->table,
-            (int) dst->src[0]->ne[0], c->n_expert, c->pcie_m, c->pcie_frac, c->decoder->gtab_dev, *c->stage, side);
+            (int) dst->src[0]->ne[0], c->n_expert, c->pcie_m, c->pcie_frac, c->decoder->gtab_dev, *c->stage, side,
+            !stage_skip_unused(c));
+}
+
+// HPCACHE_WIN_MODEL=g0,gh,gs,c0,cc replaces the lane model of the windows (microseconds)
+static const hpcache_win_model & win_model() {
+    static const hpcache_win_model m = [] {
+        hpcache_win_model r;
+        if (const char * e = getenv("HPCACHE_WIN_MODEL")) {
+            sscanf(e, "%f,%f,%f,%f,%f", &r.g0, &r.gh, &r.gs, &r.c0, &r.cc);
+        }
+        return r;
+    }();
+    return m;
+}
+
+static void pcie_stage_win_cb(ggml_tensor * dst, int, int, void * userdata) {
+    auto * c = static_cast<hpcache_decoder::op_ctx *>(userdata);
+    static const bool side = getenv("HPCACHE_PCIE_SIDE") == nullptr || atoi(getenv("HPCACHE_PCIE_SIDE")) != 0;
+    const ggml_tensor * ids = dst->src[0];
+    // the window's remap ops map an unstaged expert to miss_id, so with -1 no op reads the unused slots
+    hpcache_cuda_pcie_stage_window(custom_get_stream(dst), (const int32_t *) ids->data, (int) (ids->nb[1] / sizeof(int32_t)),
+            (int) ids->ne[1], c->table, (int) ids->ne[0], c->n_expert, c->win_cap, win_model(), c->stage_table, *c->stage, side,
+            !stage_skip_unused(c));
 }
 
 static void pcie_join_cb(ggml_tensor * dst, int, int, void *) {
@@ -1846,14 +2099,15 @@ static void pcie_join_cb(ggml_tensor * dst, int, int, void *) {
 static void pcie_ids_cb(ggml_tensor * dst, int, int, void * userdata) {
     auto * c = static_cast<hpcache_decoder::op_ctx *>(userdata);
     hpcache_cuda_pcie_select(custom_get_stream(dst), (const int32_t *) dst->src[0]->data, nullptr, c->table,
-            (int) dst->src[0]->ne[0], c->n_expert, (int) dst->ne[0], c->pcie_frac, c->decoder->gtab_dev, (int32_t *) dst->data, nullptr);
+            (int) dst->src[0]->ne[0], c->n_expert, (int) dst->ne[0], c->pcie_frac, c->decoder->gtab_dev, (int32_t *) dst->data, nullptr,
+            stage_skip_unused(c));
 }
 
 static void pcie_w_cb(ggml_tensor * dst, int, int, void * userdata) {
     auto * c = static_cast<hpcache_decoder::op_ctx *>(userdata);
     hpcache_cuda_pcie_select(custom_get_stream(dst), (const int32_t *) dst->src[0]->data,
             (const float *) dst->src[1]->data, c->table, (int) dst->src[0]->ne[0], c->n_expert, (int) dst->ne[1],
-            c->pcie_frac, c->decoder->gtab_dev, nullptr, (float *) dst->data);
+            c->pcie_frac, c->decoder->gtab_dev, nullptr, (float *) dst->data, stage_skip_unused(c));
 }
 
 static void wait_merge_cb(ggml_tensor * dst, int, int, void * userdata) {
@@ -1945,6 +2199,7 @@ void hpcache_decoder::g2_finish(void * s, const ggml_tensor * dst, const op_ctx 
 
 void hpcache_decoder::serve(uint32_t seq) {
     const int il = *db.layer;
+    const int ntok = std::max(1, std::min((int) *db.n_tok, db.max_tokens));
     HPCACHE_LOG(ring_cpu, HPE_CPU_START, seq, il);
     uint32_t n_cpu_experts = 0;
     uint32_t counts = 0;   // event log: experts on the CPU | on the first card through PCIe << 8 | on the second card << 16 | pool hits << 24
@@ -1962,7 +2217,7 @@ void hpcache_decoder::serve(uint32_t seq) {
     // HPCACHE_BLIND=1: answer without any expert math, to time everything that is not math (diagnostic, output is garbage)
     static const bool blind = getenv("HPCACHE_BLIND") != nullptr;
     if (blind) {
-        memset(db.y, 0, size_t(db.n_embd) * sizeof(float));
+        memset(db.y, 0, size_t(db.n_embd) * size_t(db.max_tokens) * sizeof(float));
         n_serve++;
         std::atomic_thread_fence(std::memory_order_seq_cst);
         *db.flag = seq;
@@ -1977,7 +2232,7 @@ void hpcache_decoder::serve(uint32_t seq) {
         }
         auto & histogram = routing[il];
         histogram.resize(n_expert, 0);
-        for (int i = 0; i < db.k; ++i) {
+        for (int i = 0; i < db.k * ntok; ++i) {
             const int32_t id = db.ids[i];
             if (id >= 0 && id < n_expert) {
                 histogram[id]++;
@@ -1990,108 +2245,231 @@ void hpcache_decoder::serve(uint32_t seq) {
         if (trace != nullptr) {
             int32_t rec[33];
             rec[0] = il;
-            memcpy(rec + 1, db.ids, size_t(db.k) * sizeof(int32_t));
-            fwrite(rec, sizeof(int32_t), size_t(db.k) + 1, trace);
+            for (int t = 0; t < ntok; ++t) {
+                memcpy(rec + 1, db.ids + t * db.k, size_t(db.k) * sizeof(int32_t));
+                fwrite(rec, sizeof(int32_t), size_t(db.k) + 1, trace);
+            }
             fflush(trace);
         }
     }
 
     if (l != nullptr) {
-        // experts in the pool are served by the GPU, the rest run here
-        int32_t ids[32];
-        float   w[32];
-        int     m = 0;
-        int     n2 = 0;   // routed to the second card
-        for (int i = 0; i < db.k; ++i) {
-            const int32_t e = db.ids[i];
-            if (e < 0 || e >= l->n_expert) {
-                continue;
-            }
-            if (!l->slot2_of.empty() && l->slot2_of[e] >= 0) {
-                ++n2;
-                continue;
-            }
-            if (l->n_slots > 0) {
-                l->score[e] += 1.0f;
-                if (l->slot_of[e] >= 0) {
+        // HPCACHE_NO_DEDUP=1: every token runs the single-token kernel, for comparing with the grouped run
+        static const bool no_dedup = getenv("HPCACHE_NO_DEDUP") != nullptr;
+        const bool group_window = ntok > 1 && !no_dedup;
+        // the experts that the GPU stages for this window, the same set as the stage kernel picks (hpcache_window_select)
+        int32_t win_sel[32];
+        int     win_g = 0;
+        if (ntok > 1 && l->win_pcie && l->n_slots > 0) {
+            struct cpu_hit {
+                const std::vector<int32_t> & slot_of;
+                bool operator()(int e) const { return slot_of[e] >= 0; }
+            };
+            win_g = hpcache_window_select(db.ids, db.k, ntok, db.k, l->n_expert, cpu_hit{ l->slot_of }, l->win_cap, win_model(), win_sel);
+            n_pcie_win_experts += win_g;
+            ++n_pcie_win_windows;
+        }
+        int32_t pair_exp[32 * 32];
+        int32_t pair_tok[32 * 32];
+        float   pair_w[32 * 32];
+        int     n_pairs = 0;
+        for (int t = 0; t < ntok; ++t) {
+            // the lane of token t: its row of the window
+            const float *   xt  = db.x + size_t(t) * db.n_embd;
+            const int32_t * idt = db.ids + size_t(t) * db.k;
+            const float *   wt  = db.w + size_t(t) * db.k;
+            float *         yt  = db.y + size_t(t) * db.n_embd;
+            // experts in the pool are served by the GPU, the rest run here
+            int32_t ids[32];
+            float   w[32];
+            int     rk[32];   // the rank of each in the token's top-k (tail_skip)
+            int     m = 0;
+            int     n2 = 0;   // routed to the second card
+            for (int i = 0; i < db.k; ++i) {
+                const int32_t e = idt[i];
+                if (e < 0 || e >= l->n_expert) {
                     continue;
                 }
-            }
-            ids[m] = e;
-            w[m]   = db.w[i];
-            ++m;
-        }
-        n_routed += db.k;
-        n_hit    += db.k - m - n2;
-        n_gpu2   += n2;
-        int g_logged = 0;
-        const int hits_here = db.k - m - n2;
-        if (l->pcie && m > 0) {
-            // the GPU takes the last g misses in routing order (pcie_select_kernel), the CPU the first m - g
-            int g = gtab_on ? int(db.gtab[hpcache_gtab_index(n2 > 0, hits_here, m)]) : (m * int(*db.frac)) >> 8;
-            g = std::min(g, std::min(opts.pcie_max, db.k));
-            g = std::min(g, m);
-            m -= g;
-            n_pcie_experts += g;
-            g_logged = g;
-        }
-
-        n_cpu_experts = m > 0 ? m : 0;
-        counts = n_cpu_experts | uint32_t(g_logged) << 8 | uint32_t(n2) << 16 | uint32_t(hits_here) << 24;
-        if (m > 0 && l->fast) {
-            cpu_pool->run(l->desc, db.x, ids, w, m, db.y);
-            static const bool verify = getenv("HPCACHE_VERIFY") != nullptr;
-            if (verify) {
-                // the same experts through the ggml graph, to compare the two kernels
-                // one ggml thread, the pool threads are spinning on the other cores
-                static bool single = [&] {
-                    typedef void (*set_n_threads_t)(ggml_backend_t, int);
-                    auto * reg = ggml_backend_dev_backend_reg(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU));
-                    auto * f = (set_n_threads_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
-                    if (f != nullptr) {
-                        f(cpu, 1);
-                    }
-                    return true;
-                }();
-                (void) single;
-                cpu_graph * ref = cpu_graph_for(*l, m);
-                if (ref != nullptr) {
-                    memcpy(ref->x->data,   db.x, size_t(db.n_embd) * sizeof(float));
-                    memcpy(ref->ids->data, ids,  size_t(m) * sizeof(int32_t));
-                    memcpy(ref->w->data,   w,    size_t(m) * sizeof(float));
-                    ggml_backend_graph_compute(cpu, ref->gf);
-                    const float * r = (const float *) ref->out->data;
-                    double num = 0.0, den = 0.0;
-                    for (int i = 0; i < db.n_embd; ++i) {
-                        num += double(db.y[i] - r[i]) * double(db.y[i] - r[i]);
-                        den += double(r[i]) * double(r[i]);
-                    }
-                    verify_n++;
-                    verify_sum += std::sqrt(num / (den + 1e-30));
-                    verify_max = std::max(verify_max, std::sqrt(num / (den + 1e-30)));
+                if (!l->slot2_of.empty() && l->slot2_of[e] >= 0) {
+                    ++n2;
+                    continue;
                 }
+                if (l->n_slots > 0) {
+                    l->score[e] += 1.0f;
+                    if (l->slot_of[e] >= 0) {
+                        continue;
+                    }
+                }
+                if (win_g > 0) {
+                    bool staged = false;
+                    for (int j = 0; j < win_g; ++j) {
+                        staged = staged || win_sel[j] == e;
+                    }
+                    if (staged) {
+                        continue;
+                    }
+                }
+                ids[m] = e;
+                w[m]   = wt[i];
+                rk[m]  = i;
+                ++m;
             }
-            m = -1;
+            n_routed += db.k;
+            n_hit    += db.k - m - n2;
+            if (ntok <= 8) {
+                const int staged_here = win_g > 0 ? (db.k - m - n2 - [&] { int h = 0; for (int i = 0; i < db.k; ++i) { const int32_t e = idt[i]; h += (e >= 0 && e < l->n_expert && l->n_slots > 0 && l->slot2_of.empty() && l->slot_of[e] >= 0) ? 1 : 0; } return h; }()) : 0;
+                pos_stat[ntok][t][0] += db.k;
+                pos_stat[ntok][t][1] += db.k - m - n2 - staged_here;
+                pos_stat[ntok][t][2] += staged_here;
+            }
+            n_gpu2   += n2;
+            int g_logged = 0;
+            const int hits_here = db.k - m - n2;
+            if (l->pcie && ntok == 1 && m > 0) {
+                // the GPU takes the last g misses in routing order (pcie_select_kernel), the CPU the first m - g
+                int g = gtab_on ? int(db.gtab[hpcache_gtab_index(n2 > 0, hits_here, m)]) : (m * int(*db.frac)) >> 8;
+                g = std::min(g, std::min(opts.pcie_max, db.k));
+                g = std::min(g, m);
+                m -= g;
+                n_pcie_experts += g;
+                g_logged = g;
+            }
+
+            // tail skip: of what is left for the CPU, an expert that every token of the window routes at rank >= tail_skip is dropped
+            static const int tail_skip = [&] { const char * e = getenv("HPCACHE_TAIL_SKIP"); return e != nullptr ? atoi(e) : opts.tail_skip; }();
+            if (tail_skip > 0 && m > 0) {
+                int keep = 0;
+                for (int j = 0; j < m; ++j) {
+                    int r = rk[j];
+                    if (ntok > 1) {
+                        for (int t2 = 0; t2 < ntok; ++t2) {
+                            const int32_t * id2 = db.ids + size_t(t2) * db.k;
+                            for (int i2 = 0; i2 < db.k && i2 < r; ++i2) {
+                                if (id2[i2] == ids[j]) {
+                                    r = i2;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if (r >= tail_skip) {
+                        ++n_tail_skipped;
+                        continue;
+                    }
+                    ids[keep] = ids[j];
+                    w[keep]   = w[j];
+                    rk[keep]  = rk[j];
+                    ++keep;
+                }
+                m = keep;
+            }
+
+            n_cpu_experts += m > 0 ? m : 0;
+            counts += uint32_t(m > 0 ? m : 0) | uint32_t(g_logged > 0 ? g_logged : win_g) << 8 | uint32_t(n2) << 16 | uint32_t(hits_here) << 24;
+            if (m > 0 && l->fast && group_window) {
+                // the experts of all the tokens run together after the loop, an expert once for the tokens that routed to it
+                for (int j = 0; j < m; ++j) {
+                    pair_exp[n_pairs] = ids[j];
+                    pair_tok[n_pairs] = t;
+                    pair_w[n_pairs]   = w[j];
+                    ++n_pairs;
+                }
+                m = -1;
+            }
+            if (m > 0 && l->fast) {
+                cpu_pool->run(l->desc, xt, ids, w, m, yt);
+                static const bool verify = getenv("HPCACHE_VERIFY") != nullptr;
+                if (verify) {
+                    // the same experts through the ggml graph, to compare the two kernels
+                    // one ggml thread, the pool threads are spinning on the other cores
+                    static bool single = [&] {
+                        typedef void (*set_n_threads_t)(ggml_backend_t, int);
+                        auto * reg = ggml_backend_dev_backend_reg(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU));
+                        auto * f = (set_n_threads_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
+                        if (f != nullptr) {
+                            f(cpu, 1);
+                        }
+                        return true;
+                    }();
+                    (void) single;
+                    cpu_graph * ref = cpu_graph_for(*l, m);
+                    if (ref != nullptr) {
+                        memcpy(ref->x->data,   xt, size_t(db.n_embd) * sizeof(float));
+                        memcpy(ref->ids->data, ids,  size_t(m) * sizeof(int32_t));
+                        memcpy(ref->w->data,   w,    size_t(m) * sizeof(float));
+                        ggml_backend_graph_compute(cpu, ref->gf);
+                        const float * r = (const float *) ref->out->data;
+                        double num = 0.0, den = 0.0;
+                        for (int i = 0; i < db.n_embd; ++i) {
+                            num += double(yt[i] - r[i]) * double(yt[i] - r[i]);
+                            den += double(r[i]) * double(r[i]);
+                        }
+                        verify_n++;
+                        verify_sum += std::sqrt(num / (den + 1e-30));
+                        verify_max = std::max(verify_max, std::sqrt(num / (den + 1e-30)));
+                    }
+                }
+                m = -1;
+            }
+            cpu_graph * g = m > 0 ? cpu_graph_for(*l, m) : nullptr;
+            if (m < 0) {
+                // served by the pool
+            } else if (g != nullptr) {
+                memcpy(g->x->data,   xt, size_t(db.n_embd) * sizeof(float));
+                memcpy(g->ids->data, ids,  size_t(m) * sizeof(int32_t));
+                memcpy(g->w->data,   w,    size_t(m) * sizeof(float));
+                ggml_backend_graph_compute(cpu, g->gf);
+                memcpy(yt, g->out->data, size_t(db.n_embd) * sizeof(float));
+            } else {
+                if (m > 0) {
+                    log(GGML_LOG_LEVEL_ERROR, "no CPU graph for layer " + std::to_string(il));
+                }
+                memset(yt, 0, size_t(db.n_embd) * sizeof(float));
+            }
         }
-        cpu_graph * g = m > 0 ? cpu_graph_for(*l, m) : nullptr;
-        if (m < 0) {
-            // served by the pool
-        } else if (g != nullptr) {
-            memcpy(g->x->data,   db.x, size_t(db.n_embd) * sizeof(float));
-            memcpy(g->ids->data, ids,  size_t(m) * sizeof(int32_t));
-            memcpy(g->w->data,   w,    size_t(m) * sizeof(float));
-            ggml_backend_graph_compute(cpu, g->gf);
-            memcpy(db.y, g->out->data, size_t(db.n_embd) * sizeof(float));
-        } else {
-            if (m > 0) {
-                log(GGML_LOG_LEVEL_ERROR, "no CPU graph for layer " + std::to_string(il));
+        if (group_window && l->fast) {
+            // group the pairs by expert (counting sort), then one call for the window
+            if (grp_of.size() < (size_t) l->n_expert) {
+                grp_of.assign(l->n_expert, -1);
             }
-            memset(db.y, 0, size_t(db.n_embd) * sizeof(float));
+            int32_t g_exp[32 * 32], g_first[32 * 32 + 1], g_pos[32 * 32], s_tok[32 * 32];
+            float   s_w[32 * 32];
+            int     n_groups = 0;
+            for (int j = 0; j < n_pairs; ++j) {
+                int & g = grp_of[pair_exp[j]];
+                if (g < 0) {
+                    g = n_groups;
+                    g_exp[n_groups] = pair_exp[j];
+                    g_first[n_groups] = 0;
+                    ++n_groups;
+                }
+                ++g_first[g];
+            }
+            int32_t at = 0;
+            for (int g = 0; g < n_groups; ++g) {
+                const int32_t cnt = g_first[g];
+                g_first[g] = at;
+                g_pos[g]   = at;
+                at += cnt;
+            }
+            g_first[n_groups] = at;
+            for (int j = 0; j < n_pairs; ++j) {
+                const int g = grp_of[pair_exp[j]];
+                s_tok[g_pos[g]] = pair_tok[j];
+                s_w[g_pos[g]]   = pair_w[j];
+                ++g_pos[g];
+            }
+            for (int g = 0; g < n_groups; ++g) {
+                grp_of[g_exp[g]] = -1;
+            }
+            cpu_pool->run_multi(l->desc, db.x, ntok, g_exp, g_first, n_groups, s_tok, s_w, db.y);
+            n_dedup_pairs += n_pairs;
+            n_dedup_groups += n_groups;
         }
     } else {
         // release the GPU anyway, a stuck wait would end in a driver timeout
         log(GGML_LOG_LEVEL_ERROR, "no CPU graph for layer " + std::to_string(il));
-        memset(db.y, 0, size_t(db.n_embd) * sizeof(float));
+        memset(db.y, 0, size_t(db.n_embd) * size_t(ntok) * sizeof(float));
     }
 
     serve_us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t_start).count();
@@ -2355,8 +2733,8 @@ void hpcache_decoder::arm() {
 }
 
 void hpcache_decoder::begin(const llama_moe_decode_info & info) {
-    // only single-token graphs contain the doorbell ops
-    if (info.n_tokens != 1 || db.block == nullptr || !ok()) {
+    // only graphs of a window that fits the doorbell contain the doorbell ops
+    if (info.n_tokens < 1 || db.block == nullptr || info.n_tokens > db.max_tokens || !ok()) {
         return;
     }
     HPCACHE_LOG(ring_main, HPE_BEGIN_ENTER, (uint32_t) n_decode.load(), -2);
@@ -2481,7 +2859,7 @@ void hpcache_decoder::admit() {
         flush_tables();
     }
     if (!pending.empty()) {
-        copier_submit(pending);
+        submit_swaps(pending);
     }
     if (!opts.async_swaps) {
         publish_pending();

@@ -10,6 +10,10 @@
 static std::atomic<int64_t> g_ns_b{0}, g_ns_c{0}, g_ns_d{0}, g_runs{0};
 // HPCACHE_PHASES: time summed over all threads: 0 wake delay, 1 gate/up, 2 wait, 3 quantize, 4 wait, 5 down, 6 wait, 7 reduce
 static const bool g_tm = getenv("HPCACHE_PHASES") != nullptr;
+// run_multi (windows): calls, distinct experts, pairs, bytes of expert weights, and thread 0's wall per phase and per call, ns
+static std::atomic<int64_t> g_m_runs{0}, g_m_groups{0}, g_m_pairs{0}, g_m_bytes{0}, g_m_gu{0}, g_m_q{0}, g_m_dn{0}, g_m_red{0}, g_m_call{0}, g_m_pre{0};
+// the time the threads spend waiting at the barriers after the gate/up and the down phase, summed over threads, ns
+static std::atomic<int64_t> g_m_wait_gu{0}, g_m_wait_dn{0};
 static std::atomic<int64_t> g_ph[8];
 static inline int64_t now_ns() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -35,6 +39,12 @@ struct hpcache_cpu_pool::task {
     uint8_t *       actq    = nullptr;
     float *         part    = nullptr;
 
+    // several tokens, see run_multi: ids and w are per group and per pair then
+    int             n_groups = 0;
+    int             n_tok    = 0;
+    const int32_t * g_first  = nullptr;
+    const int32_t * p_tok    = nullptr;
+
     int64_t t_start = 0;
     std::atomic<int> next_b{0};
     std::atomic<int> next_d{0};
@@ -55,6 +65,15 @@ hpcache_cpu_pool::~hpcache_cpu_pool() {
         fprintf(stderr, "hpcache cpu pool per thread and run, us: wake %.1f | gate/up work %.1f wait %.1f | quantize %.1f wait %.1f |"
                 " down work %.1f wait %.1f | reduce %.1f\n", g_ph[0] * k, g_ph[1] * k, g_ph[2] * k, g_ph[3] * k, g_ph[4] * k,
                 g_ph[5] * k, g_ph[6] * k, g_ph[7] * k);
+    }
+    if (g_m_runs.load() > 0 && g_tm) {
+        const double n = double(g_m_runs.load());
+        fprintf(stderr, "hpcache cpu pool, windows (run_multi): %lld calls, %.2f distinct experts and %.2f pairs per call; per call us: total %.0f (before publish %.0f), "
+                "gate/up %.0f, quantize %.0f, down %.0f, reduce %.0f; thread-mean wait at the barriers: after gate/up %.0f, after down %.0f us; %.2f GB/s over the row phases, %.1f us per expert\n",
+                (long long) g_m_runs.load(), g_m_groups.load() / n, g_m_pairs.load() / n, g_m_call.load() / 1e3 / n, g_m_pre.load() / 1e3 / n,
+                g_m_gu.load() / 1e3 / n, g_m_q.load() / 1e3 / n, g_m_dn.load() / 1e3 / n, g_m_red.load() / 1e3 / n,
+                g_m_wait_gu.load() / 1e3 / n / n_threads, g_m_wait_dn.load() / 1e3 / n / n_threads,
+                double(g_m_bytes.load()) / double(g_m_gu.load() + g_m_dn.load()), double(g_m_gu.load() + g_m_dn.load()) / 1e3 / double(g_m_groups.load()));
     }
     quit.store(true);
     wake.notify();
@@ -410,6 +429,10 @@ constexpr int RB_GATE = 16;
 constexpr int RB_DOWN = 64;
 
 void hpcache_cpu_pool::execute(task & t, int ith) {
+    if (t.n_groups > 0) {
+        execute_multi(t, ith);
+        return;
+    }
     const hpcache_expert_desc & d = *t.d;
     const int m = t.m;
     const int64_t n_ff  = d.n_ff;
@@ -536,6 +559,181 @@ void hpcache_cpu_pool::execute(task & t, int ith) {
         g_runs++;
     }
     (void) t1;
+}
+
+// The same three phases as execute(), over the groups of run_multi: a row of an expert is dotted with the activation of
+// every token of the group while it is in the cache, so the expert is read from memory once.
+void hpcache_cpu_pool::execute_multi(task & t, int ith) {
+    const hpcache_expert_desc & d = *t.d;
+    const int64_t n_ff  = d.n_ff;
+    const int64_t n_out = d.n_embd;
+    const int64_t m0 = g_tm ? now_ns() : 0;
+
+    const int blocks_b = (int) ((n_ff + RB_GATE - 1) / RB_GATE);
+    const int items_b  = t.n_groups * blocks_b;
+    for (;;) {
+        const int item = t.next_b.fetch_add(1, std::memory_order_relaxed);
+        if (item >= items_b) {
+            break;
+        }
+        const int     g    = item / blocks_b;
+        const int64_t row0 = int64_t(item % blocks_b) * RB_GATE;
+        const int64_t row1 = std::min<int64_t>(row0 + RB_GATE, n_ff);
+        const size_t  e    = (size_t) t.ids[g];
+        const int     p0   = t.g_first[g];
+        const int     p1   = t.g_first[g + 1];
+        const char * gp = d.gate + e * d.gate_exp + size_t(row0) * d.gate_row;
+        const char * up = d.up   + e * d.up_exp   + size_t(row0) * d.up_row;
+        for (int64_t row = row0; row < row1; ++row, gp += d.gate_row, up += d.up_row) {
+            prefetch_row(gp + 2 * d.gate_row, d.gate_row);
+            prefetch_row(up + 2 * d.up_row, d.up_row);
+            for (int p = p0; p < p1; ++p) {
+                const int tk = t.p_tok[p];
+                float gv = 0.0f, uv = 0.0f;
+                d.gate_dot((int) d.n_embd, &gv, 0, gp, 0, t.xq_gate + size_t(tk) * d.gate_xq_bytes, 0, 1);
+                d.up_dot((int) d.n_embd, &uv, 0, up, 0, t.xq_up + size_t(tk) * d.up_xq_bytes, 0, 1);
+                float a;
+                if (d.clamp > 1e-6f) {
+                    a = std::min(silu(gv), d.clamp) * std::max(-d.clamp, std::min(uv, d.clamp));
+                } else {
+                    a = silu(gv) * uv;
+                }
+                t.act[int64_t(p) * n_ff + row] = a;
+            }
+        }
+    }
+    const int64_t m1 = g_tm ? now_ns() : 0;
+    barrier();
+    const int64_t m2 = g_tm ? now_ns() : 0;
+
+    for (int p = ith; p < t.m; p += n_threads) {
+        d.down_quant(t.act + int64_t(p) * n_ff, t.actq + size_t(p) * d.down_xq_bytes, n_ff);
+    }
+    barrier();
+    const int64_t m3 = g_tm ? now_ns() : 0;
+
+    const int blocks_d = (int) ((n_out + RB_DOWN - 1) / RB_DOWN);
+    const int items_d  = t.n_groups * blocks_d;
+    for (;;) {
+        const int item = t.next_d.fetch_add(1, std::memory_order_relaxed);
+        if (item >= items_d) {
+            break;
+        }
+        const int     g    = item / blocks_d;
+        const int64_t row0 = int64_t(item % blocks_d) * RB_DOWN;
+        const int64_t row1 = std::min<int64_t>(row0 + RB_DOWN, n_out);
+        const size_t  e    = (size_t) t.ids[g];
+        const int     p0   = t.g_first[g];
+        const int     p1   = t.g_first[g + 1];
+        const char *  dp   = d.down + e * d.down_exp + size_t(row0) * d.down_row;
+        for (int64_t row = row0; row < row1; ++row, dp += d.down_row) {
+            prefetch_row(dp + 4 * d.down_row, d.down_row);
+            for (int p = p0; p < p1; ++p) {
+                float v = 0.0f;
+                d.down_dot((int) n_ff, &v, 0, dp, 0, t.actq + size_t(p) * d.down_xq_bytes, 0, 1);
+                t.part[int64_t(p) * n_out + row] = t.w[p] * v;
+            }
+        }
+    }
+    const int64_t m4 = g_tm ? now_ns() : 0;
+    barrier();
+    const int64_t m5 = g_tm ? now_ns() : 0;
+    if (g_tm) {
+        g_m_wait_gu += m2 - m1;
+        g_m_wait_dn += m5 - m4;
+    }
+
+    for (int64_t r = ith * 64; r < n_out; r += int64_t(n_threads) * 64) {
+        const int64_t r1 = std::min<int64_t>(r + 64, n_out);
+        for (int64_t row = r; row < r1; ++row) {
+            float acc[32] = {};
+            for (int p = 0; p < t.m; ++p) {
+                acc[t.p_tok[p]] += t.part[int64_t(p) * n_out + row];
+            }
+            for (int tk = 0; tk < t.n_tok; ++tk) {
+                t.y[int64_t(tk) * n_out + row] = acc[tk];
+            }
+        }
+    }
+    if (g_tm && ith == 0) {
+        const int64_t m6 = now_ns();
+        g_m_gu += m2 - m0;
+        g_m_q += m3 - m2;
+        g_m_dn += m5 - m3;
+        g_m_red += m6 - m5;
+        g_m_runs++;
+        g_m_groups += t.n_groups;
+        g_m_pairs += t.m;
+        g_m_bytes += int64_t(t.n_groups) * int64_t(d.gate_exp + d.up_exp + d.down_exp);
+    }
+}
+
+void hpcache_cpu_pool::run_multi(const hpcache_expert_desc & d, const float * x, int n_tok, const int32_t * ids,
+        const int32_t * g_first, int n_groups, const int32_t * p_tok, const float * p_w, float * y) {
+    const int n_pairs = n_groups > 0 ? g_first[n_groups] : 0;
+    if (n_pairs == 0) {
+        memset(y, 0, size_t(n_tok) * d.n_embd * sizeof(float));
+        return;
+    }
+    const int64_t c0 = g_tm ? now_ns() : 0;
+    if (xq_gate.size() < d.gate_xq_bytes * n_tok) {
+        xq_gate.resize(d.gate_xq_bytes * n_tok);
+    }
+    if (xq_up.size() < d.up_xq_bytes * n_tok) {
+        xq_up.resize(d.up_xq_bytes * n_tok);
+    }
+    if (actq.size() < d.down_xq_bytes * n_pairs) {
+        actq.resize(d.down_xq_bytes * n_pairs);
+    }
+    if (act.size() < size_t(n_pairs) * d.n_ff) {
+        act.resize(size_t(n_pairs) * d.n_ff);
+    }
+    if (part.size() < size_t(n_pairs) * d.n_embd) {
+        part.resize(size_t(n_pairs) * d.n_embd);
+    }
+    for (int tk = 0; tk < n_tok; ++tk) {
+        d.gate_quant(x + int64_t(tk) * d.n_embd, xq_gate.data() + size_t(tk) * d.gate_xq_bytes, d.n_embd);
+        d.up_quant(x + int64_t(tk) * d.n_embd, xq_up.data() + size_t(tk) * d.up_xq_bytes, d.n_embd);
+    }
+
+    task t;
+    t.d        = &d;
+    t.ids      = ids;
+    t.w        = p_w;
+    t.m        = n_pairs;
+    t.y        = y;
+    t.n_groups = n_groups;
+    t.n_tok    = n_tok;
+    t.g_first  = g_first;
+    t.p_tok    = p_tok;
+    t.xq_gate  = xq_gate.data();
+    t.xq_up    = xq_up.data();
+    t.act      = act.data();
+    t.actq     = actq.data();
+    t.part     = part.data();
+
+    if (!active.load(std::memory_order_acquire)) {
+        set_active(true);
+    }
+
+    done.store(0, std::memory_order_relaxed);
+    bar_count.store(0, std::memory_order_relaxed);
+    t.t_start = g_tm ? now_ns() : 0;
+    current.store(&t, std::memory_order_release);
+    job_gen.fetch_add(1, std::memory_order_acq_rel);
+
+    if (g_tm) {
+        g_m_pre += now_ns() - c0;
+    }
+    execute(t, 0);
+
+    const int others = n_threads - 1;
+    while (done.load(std::memory_order_acquire) < others) {
+        HPCACHE_PAUSE();
+    }
+    if (g_tm) {
+        g_m_call += now_ns() - c0;
+    }
 }
 
 void hpcache_cpu_pool::run(const hpcache_expert_desc & d, const float * x, const int32_t * ids, const float * w,

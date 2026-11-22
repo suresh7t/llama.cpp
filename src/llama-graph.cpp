@@ -2301,10 +2301,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
 
-    // a MoE provider can compute the routed experts for single-token decode
+    // a MoE provider can compute the routed experts of a decode window, it returns NULL for a window it does not take
     // the stock path stays for anything that the provider interface does not carry
-    // the ubatch size matters, the last layer can have a single row left in a larger ubatch
-    if (moe_provider != nullptr && moe_provider->build_moe_layer != nullptr && ubatch.n_tokens == 1 && n_tokens == 1 &&
+    // the ubatch size matters, the last layer can have fewer rows left in a larger ubatch
+    if (moe_provider != nullptr && moe_provider->build_moe_layer != nullptr && ubatch.n_tokens == n_tokens &&
             !weight_before_ffn && !cparams.warmup &&
             !up_exps_b && !gate_exps_b && !down_exps_b && !gate_up_exps_b && !up_exps_s && !gate_exps_s && !down_exps_s &&
             (loras == nullptr || loras->empty())) {

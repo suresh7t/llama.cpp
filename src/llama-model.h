@@ -926,6 +926,8 @@ struct llama_model {
     bool has_tensor_overrides() const;
 
     const struct llama_moe_provider_api * moe_provider() const { return params.moe_provider; }
+    // the provider that builds the output head, the one of the model unless the model was given one for that only
+    const struct llama_moe_provider_api * moe_output_provider() const { return params.moe_output_provider != nullptr ? params.moe_output_provider : params.moe_provider; }
 
     const struct ggml_tensor * get_tensor(const char * name) const;
 

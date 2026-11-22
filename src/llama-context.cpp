@@ -2576,6 +2576,11 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         }
     }
 
+    // a MoE provider adds its own staging, publish and merge nodes to every layer
+    if (model.moe_provider() != nullptr) {
+        res += 256u * model.hparams.n_layer();
+    }
+
     // every sampler builds n_outputs_max_per_seq chains, see llm_graph_context::build_sampling
     for (const auto & [seq_id, sampler] : sampling.samplers) {
         res += llama_sampler_backend_n_nodes(sampler) * cparams.n_outputs_max_per_seq;

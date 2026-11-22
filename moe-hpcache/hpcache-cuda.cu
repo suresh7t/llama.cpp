@@ -2,6 +2,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -13,13 +14,14 @@ static size_t round_up(size_t n) {
     return (n + 255) & ~size_t(255);
 }
 
-bool hpcache_doorbell_init(hpcache_doorbell & db, int n_embd, int k, std::string & error) {
-    // one cache line each for the counters, then the arrays
+bool hpcache_doorbell_init(hpcache_doorbell & db, int n_embd, int k, int max_tokens, std::string & error) {
+    // one cache line each for the counters, then the arrays; x, ids, w and y hold max_tokens tokens
+    const size_t nt      = size_t(max_tokens < 1 ? 1 : max_tokens);
     const size_t off_x   = 384;
-    const size_t off_ids = off_x   + round_up(size_t(n_embd) * sizeof(float));
-    const size_t off_w   = off_ids + round_up(size_t(k) * sizeof(int32_t));
-    const size_t off_y   = off_w   + round_up(size_t(k) * sizeof(float));
-    const size_t off_y2  = off_y   + round_up(size_t(n_embd) * sizeof(float));
+    const size_t off_ids = off_x   + round_up(size_t(n_embd) * nt * sizeof(float));
+    const size_t off_w   = off_ids + round_up(size_t(k) * nt * sizeof(int32_t));
+    const size_t off_y   = off_w   + round_up(size_t(k) * nt * sizeof(float));
+    const size_t off_y2  = off_y   + round_up(size_t(n_embd) * nt * sizeof(float));
     const size_t off_gtab = off_y2 + round_up(size_t(n_embd) * sizeof(float));
     const size_t total   = off_gtab + round_up(size_t(hpcache_gtab_size));
 
@@ -44,11 +46,13 @@ bool hpcache_doorbell_init(hpcache_doorbell & db, int n_embd, int k, std::string
 
     db.n_embd = n_embd;
     db.k      = k;
+    db.max_tokens = int(nt);
     db.block  = host;
 
     db.seq   = reinterpret_cast<volatile uint32_t *>(h + 0);
     db.flag  = reinterpret_cast<volatile uint32_t *>(h + 64);
     db.layer = reinterpret_cast<volatile int32_t  *>(h + 128);
+    db.n_tok = reinterpret_cast<volatile int32_t  *>(h + 132);
     db.frac  = reinterpret_cast<volatile int32_t  *>(h + 192);
     db.wait_ns = reinterpret_cast<volatile unsigned long long *>(h + 200);
     db.flag2 = reinterpret_cast<volatile uint32_t *>(h + 256);
@@ -63,6 +67,7 @@ bool hpcache_doorbell_init(hpcache_doorbell & db, int n_embd, int k, std::string
     db.d_seq   = reinterpret_cast<volatile uint32_t *>(d + 0);
     db.d_flag  = reinterpret_cast<volatile uint32_t *>(d + 64);
     db.d_layer = reinterpret_cast<volatile int32_t  *>(d + 128);
+    db.d_n_tok = reinterpret_cast<volatile int32_t  *>(d + 132);
     db.d_frac  = reinterpret_cast<volatile int32_t  *>(d + 192);
     db.d_wait_ns = reinterpret_cast<volatile unsigned long long *>(d + 200);
     db.d_flag2 = reinterpret_cast<volatile uint32_t *>(d + 256);
@@ -109,7 +114,8 @@ static __device__ void device_log(hpcache_metric_dev m, unsigned code, int arg0,
 // The ring increments the counter in memory. It must not take the new value as an argument,
 // because that value would be fixed when the graph is built.
 static __global__ void publish_kernel(const float * x, const int32_t * ids, const float * w, int n, int k, int layer,
-        float * x_out, int32_t * ids_out, float * w_out, volatile int32_t * layer_out, volatile uint32_t * seq
+        float * x_out, int32_t * ids_out, float * w_out, volatile int32_t * layer_out, volatile uint32_t * seq,
+        int n_tokens, int x_stride, int ids_stride, int w_stride, volatile int32_t * n_tok_out
         HPCACHE_LOG_PARAM(hpcache_metric_dev m)) {
 #ifdef HPCACHE_EVENT_LOG
     unsigned long long t_start = 0;
@@ -117,17 +123,18 @@ static __global__ void publish_kernel(const float * x, const int32_t * ids, cons
         t_start = global_ns();
     }
 #endif
-    for (int i = threadIdx.x; i < n; i += blockDim.x) {
-        x_out[i] = x[i];
+    for (int i = threadIdx.x; i < n * n_tokens; i += blockDim.x) {
+        x_out[i] = x[(i / n) * x_stride + i % n];
     }
-    for (int i = threadIdx.x; i < k; i += blockDim.x) {
-        ids_out[i] = ids[i];
-        w_out[i]   = w[i];
+    for (int i = threadIdx.x; i < k * n_tokens; i += blockDim.x) {
+        ids_out[i] = ids[(i / k) * ids_stride + i % k];
+        w_out[i]   = w[(i / k) * w_stride + i % k];
     }
     __threadfence_system();
     __syncthreads();
     if (threadIdx.x == 0) {
         *layer_out = layer;
+        *n_tok_out = n_tokens;
         __threadfence_system();
         *seq = *seq + 1u;
 #ifdef HPCACHE_EVENT_LOG
@@ -214,9 +221,10 @@ static void nudge_submission(cudaStream_t stream) {
 }
 
 void hpcache_cuda_publish(void * stream, const hpcache_doorbell & db,
-        const float * x, const int32_t * ids, const float * w, int layer) {
+        const float * x, const int32_t * ids, const float * w, int layer, int n_tokens, int x_stride, int ids_stride, int w_stride) {
     publish_kernel<<<1, 256, 0, (cudaStream_t) stream>>>(x, ids, w, db.n_embd, db.k, layer,
-            db.d_x, db.d_ids, db.d_w, db.d_layer, db.d_seq HPCACHE_LOG_ARG(db.lead_m));
+            db.d_x, db.d_ids, db.d_w, db.d_layer, db.d_seq, n_tokens, x_stride, ids_stride, w_stride, db.d_n_tok
+            HPCACHE_LOG_ARG(db.lead_m));
     const cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "moe-hpcache: publish kernel launch failed: %s\n", cudaGetErrorString(err));
@@ -240,8 +248,8 @@ void hpcache_cuda_g2_finish(void * stream, const hpcache_doorbell & db, const fl
     cudaGetLastError();
 }
 
-void hpcache_cuda_wait_merge(void * stream, const hpcache_doorbell & db, float * dst) {
-    wait_merge_kernel<<<1, 256, 0, (cudaStream_t) stream>>>(db.d_flag, db.d_seq, db.d_y, dst, db.n_embd, db.d_wait_ns,
+void hpcache_cuda_wait_merge(void * stream, const hpcache_doorbell & db, float * dst, int n_tokens) {
+    wait_merge_kernel<<<1, 256, 0, (cudaStream_t) stream>>>(db.d_flag, db.d_seq, db.d_y, dst, db.n_embd * n_tokens, db.d_wait_ns,
             db.two ? db.d_flag2 : nullptr, db.two ? db.d_y2 : nullptr, db.d_stats HPCACHE_LOG_ARG(db.lead_m));
     const cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
@@ -529,6 +537,159 @@ bool hpcache_cuda_copy_wait() {
     return s != nullptr && cudaStreamSynchronize(s) == cudaSuccess;
 }
 
+// Copy uint4 [begin, end) with U loads in flight per thread. A load from host memory (through PCIe) takes 1-2 us, and a
+// thread that stores right after its load has only one in flight, so a plain loop needs many blocks to fill the link, and
+// those blocks hold the load queues of every SM and slow the kernels next to them (matvecs about 3x, see nsoverlap.py).
+template <int U>
+static __device__ __forceinline__ void copy_u4(uint4 * dst, const uint4 * src, size_t begin, size_t end, size_t tid, size_t stride) {
+    size_t i = begin + tid;
+    for (; i + size_t(U - 1) * stride < end; i += size_t(U) * stride) {
+        uint4 v[U];
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+            v[u] = src[i + size_t(u) * stride];
+        }
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+            dst[i + size_t(u) * stride] = v[u];
+        }
+    }
+    for (; i < end; i += stride) {
+        dst[i] = src[i];
+    }
+}
+
+// one piece of a swap copy, at most swap_chunk_n16 uint4
+struct hpcache_swap_chunk {
+    const uint4 * src;
+    uint4 *       dst;
+    unsigned int  n16;
+    unsigned int  pad;
+};
+
+static constexpr unsigned int swap_chunk_n16 = 4096;   // 64 KiB
+
+// a grid-stride loop over the chunks; the chunk list is in mapped host memory, thread 0 reads each entry once
+static __global__ void swap_copy_kernel(const hpcache_swap_chunk * chunks, int n) {
+    __shared__ hpcache_swap_chunk c;
+    for (int i = blockIdx.x; i < n; i += gridDim.x) {
+        if (threadIdx.x == 0) {
+            c = chunks[i];
+        }
+        __syncthreads();
+        copy_u4<4>(c.dst, c.src, 0, c.n16, threadIdx.x, blockDim.x);
+        __syncthreads();
+    }
+}
+
+static struct {
+    int                  device  = -1;
+    cudaStream_t         stream  = nullptr;
+    cudaEvent_t          done    = nullptr;
+    hpcache_swap_chunk * h_chunks = nullptr;   // mapped, page-locked
+    hpcache_swap_chunk * d_chunks = nullptr;   // its device address
+    int                  cap     = 0;
+    bool                 launched = false;
+} swap_state;
+
+bool hpcache_cuda_swap_copy(int device, const hpcache_swap_copy * copies, int n) {
+    if (n <= 0) {
+        return true;
+    }
+    int prev = 0;
+    cudaGetDevice(&prev);
+    if (device >= 0) {
+        cudaSetDevice(device);
+    }
+    auto fail = [&]() {
+        cudaGetLastError();
+        cudaSetDevice(prev);
+        return false;
+    };
+    if (swap_state.stream == nullptr) {
+        int least = 0, greatest = 0;
+        cudaDeviceGetStreamPriorityRange(&least, &greatest);   // the least urgent one: every other kernel goes first
+        if (cudaStreamCreateWithPriority(&swap_state.stream, cudaStreamNonBlocking, least) != cudaSuccess ||
+            cudaEventCreateWithFlags(&swap_state.done, cudaEventDisableTiming) != cudaSuccess) {
+            return fail();
+        }
+        swap_state.device = device;
+    }
+    // the chunk list is rewritten below, so the previous kernel must be done with it
+    if (swap_state.launched && cudaEventSynchronize(swap_state.done) != cudaSuccess) {
+        return fail();
+    }
+    swap_state.launched = false;
+
+    int n_chunks = 0;
+    for (int i = 0; i < n; ++i) {
+        n_chunks += int((copies[i].bytes / 16 + swap_chunk_n16 - 1) / swap_chunk_n16);
+    }
+    if (n_chunks > swap_state.cap) {
+        if (swap_state.h_chunks != nullptr) {
+            cudaFreeHost(swap_state.h_chunks);
+            swap_state.h_chunks = nullptr;
+            swap_state.d_chunks = nullptr;
+            swap_state.cap = 0;
+        }
+        const int cap = std::max(n_chunks, 1024);
+        void * h = nullptr;
+        void * d = nullptr;
+        if (cudaHostAlloc(&h, size_t(cap) * sizeof(hpcache_swap_chunk), cudaHostAllocMapped) != cudaSuccess) {
+            return fail();
+        }
+        if (cudaHostGetDevicePointer(&d, h, 0) != cudaSuccess) {
+            cudaFreeHost(h);
+            return fail();
+        }
+        swap_state.h_chunks = static_cast<hpcache_swap_chunk *>(h);
+        swap_state.d_chunks = static_cast<hpcache_swap_chunk *>(d);
+        swap_state.cap = cap;
+    }
+    int c = 0;
+    for (int i = 0; i < n; ++i) {
+        const uint4 * src = static_cast<const uint4 *>(copies[i].src);
+        uint4 *       dst = static_cast<uint4 *>(copies[i].dst);
+        const size_t  n16 = copies[i].bytes / 16;
+        for (size_t off = 0; off < n16; off += swap_chunk_n16) {
+            const size_t m = std::min<size_t>(swap_chunk_n16, n16 - off);
+            swap_state.h_chunks[c++] = { src + off, dst + off, unsigned(m), 0 };
+        }
+    }
+    // a small grid: 2 blocks x 256 threads x 4 loads of 16 B in flight are enough for the link, and only 2 SMs carry the slow
+    // host reads (32 blocks slowed the MTP head's matvecs about 3x); HPCACHE_SWAP_BLOCKS overrides
+    static const int blocks = getenv("HPCACHE_SWAP_BLOCKS") ? std::max(1, atoi(getenv("HPCACHE_SWAP_BLOCKS"))) : 2;
+    swap_copy_kernel<<<blocks, 256, 0, swap_state.stream>>>(swap_state.d_chunks, c);
+    if (cudaGetLastError() != cudaSuccess || cudaEventRecord(swap_state.done, swap_state.stream) != cudaSuccess) {
+        cudaStreamSynchronize(swap_state.stream);
+        return fail();
+    }
+    swap_state.launched = true;
+    cudaSetDevice(prev);
+    return true;
+}
+
+bool hpcache_cuda_swap_done() {
+    if (!swap_state.launched) {
+        return true;
+    }
+    const cudaError_t e = cudaEventQuery(swap_state.done);
+    if (e == cudaErrorNotReady) {
+        cudaGetLastError();
+        return false;
+    }
+    return true;
+}
+
+bool hpcache_cuda_swap_wait() {
+    if (!swap_state.launched) {
+        return true;
+    }
+    const bool ok = cudaEventSynchronize(swap_state.done) == cudaSuccess;
+    swap_state.launched = false;
+    return ok;
+}
+
 // miss is the id written for an expert that is not in the pool: 0 computes slot 0 and the weight of that column is
 // zero, a negative id makes the quantized matvec of ggml-cuda skip the column (mmvq.cu)
 static __global__ void remap_ids_kernel(const int32_t * ids, const int32_t * table, int k, int32_t miss, int32_t * out) {
@@ -581,7 +742,7 @@ bool hpcache_cuda_host_register(void * ptr, size_t nbytes, bool pin) {
 }
 
 static __global__ void pcie_select_kernel(const int32_t * ids, const float * w, const int32_t * table, int k, int n_expert,
-        int m, const volatile int32_t * frac_ptr, const volatile int8_t * gtab, int32_t * out_ids, float * out_w) {
+        int m, const volatile int32_t * frac_ptr, const volatile int8_t * gtab, int32_t * out_ids, float * out_w, bool skip_unused) {
     if (threadIdx.x != 0) {
         return;
     }
@@ -624,7 +785,7 @@ static __global__ void pcie_select_kernel(const int32_t * ids, const float * w, 
             }
         } else {
             if (out_ids != nullptr) {
-                out_ids[j] = j;
+                out_ids[j] = skip_unused ? -1 : j;   // -1: the quantized matvec skips the column, the slot is not read
             }
             if (out_w != nullptr) {
                 out_w[j] = 0.0f;
@@ -634,8 +795,9 @@ static __global__ void pcie_select_kernel(const int32_t * ids, const float * w, 
 }
 
 void hpcache_cuda_pcie_select(void * stream, const int32_t * ids, const float * w, const int32_t * table,
-        int k, int n_expert, int m, const volatile int32_t * frac256, const volatile int8_t * gtab, int32_t * out_ids, float * out_w) {
-    pcie_select_kernel<<<1, 32, 0, (cudaStream_t) stream>>>(ids, w, table, k, n_expert, m, frac256, gtab, out_ids, out_w);
+        int k, int n_expert, int m, const volatile int32_t * frac256, const volatile int8_t * gtab, int32_t * out_ids, float * out_w,
+        bool skip_unused) {
+    pcie_select_kernel<<<1, 32, 0, (cudaStream_t) stream>>>(ids, w, table, k, n_expert, m, frac256, gtab, out_ids, out_w, skip_unused);
 }
 
 int8_t * hpcache_cuda_upload(int device, const void * host, size_t bytes) {
@@ -666,9 +828,17 @@ void * hpcache_cuda_host_device_ptr(const void * ptr) {
     return dev;
 }
 
+// grid z of the stage kernels: HPCACHE_STAGE_Z (default 2), read once. With 4 loads in flight per thread, 2 blocks per
+// (slot, tensor) still fill the link; 32 (the old value) filled every SM and slowed the matvecs next to it about 3x
+// (story, 2026-11-21: MTP1 37.9 -> 41.2 t/s, no-MTP 33.1 -> 35.5 together with the zero-fill skip and 2-4 swap blocks)
+static unsigned stage_z() {
+    static const unsigned z = getenv("HPCACHE_STAGE_Z") ? unsigned(std::max(1, atoi(getenv("HPCACHE_STAGE_Z")))) : 2u;
+    return z;
+}
+
 // one block per (selected expert, tensor, 16 KiB chunk); every block repeats the selection, which is 32 loop steps
 static __global__ void pcie_stage_kernel(const int32_t * ids, const int32_t * table, int k, int n_expert, int m,
-        const volatile int32_t * frac_ptr, const volatile int8_t * gtab, hpcache_stage_args a) {
+        const volatile int32_t * frac_ptr, const volatile int8_t * gtab, hpcache_stage_args a, bool zero_unused) {
     __shared__ int sel[32];
     __shared__ int g;
     if (threadIdx.x == 0) {
@@ -711,15 +881,23 @@ static __global__ void pcie_stage_kernel(const int32_t * ids, const int32_t * ta
         return;
     }
     const size_t n16 = a.bytes[t] / 16;
-    // an unused slot is zeroed: it holds the bytes of another layer's tensor type, which can decode to NaN
+    // an unused slot is zeroed: it holds the bytes of another layer's tensor type, which can decode to NaN. Not needed when
+    // the select op writes id -1 for it (zero_unused false), then the matvec skips the column and never reads the slot
     const bool fill = j < g;
+    if (!fill && !zero_unused) {
+        return;
+    }
     const uint4 * src = fill ? reinterpret_cast<const uint4 *>(static_cast<const char *>(a.src[t]) + size_t(sel[j]) * a.bytes[t]) : nullptr;
     uint4 * dst = reinterpret_cast<uint4 *>(static_cast<char *>(a.dst[t]) + size_t(j) * a.bytes[t]);
     const size_t chunk = 1024;   // uint4 per block-z step: 16 KiB
     for (size_t base = size_t(blockIdx.z) * chunk; base < n16; base += size_t(gridDim.z) * chunk) {
         const size_t end = base + chunk < n16 ? base + chunk : n16;
-        for (size_t i = base + threadIdx.x; i < end; i += blockDim.x) {
-            dst[i] = fill ? src[i] : make_uint4(0, 0, 0, 0);
+        if (fill) {
+            copy_u4<4>(dst, src, base, end, threadIdx.x, blockDim.x);
+        } else {
+            for (size_t i = base + threadIdx.x; i < end; i += blockDim.x) {
+                dst[i] = make_uint4(0, 0, 0, 0);
+            }
         }
     }
 }
@@ -730,11 +908,11 @@ static cudaEvent_t  stage_fork   = nullptr;
 static cudaEvent_t  stage_join   = nullptr;
 
 void hpcache_cuda_pcie_stage(void * stream, const int32_t * ids, const int32_t * table, int k, int n_expert, int m,
-        const volatile int32_t * frac256, const volatile int8_t * gtab, const hpcache_stage_args & args, bool side) {
+        const volatile int32_t * frac256, const volatile int8_t * gtab, const hpcache_stage_args & args, bool side, bool zero_unused) {
     // enough blocks along z to keep many PCIe reads in flight
-    const dim3 grid(unsigned(m), unsigned(args.n_tensors), 32);
+    const dim3 grid(unsigned(m), unsigned(args.n_tensors), stage_z());
     if (!side) {
-        pcie_stage_kernel<<<grid, 256, 0, (cudaStream_t) stream>>>(ids, table, k, n_expert, m, frac256, gtab, args);
+        pcie_stage_kernel<<<grid, 256, 0, (cudaStream_t) stream>>>(ids, table, k, n_expert, m, frac256, gtab, args, zero_unused);
         return;
     }
     if (stage_stream == nullptr) {
@@ -744,8 +922,102 @@ void hpcache_cuda_pcie_stage(void * stream, const int32_t * ids, const int32_t *
     }
     cudaEventRecord(stage_fork, (cudaStream_t) stream);
     cudaStreamWaitEvent(stage_stream, stage_fork, 0);
-    pcie_stage_kernel<<<grid, 256, 0, stage_stream>>>(ids, table, k, n_expert, m, frac256, gtab, args);
+    pcie_stage_kernel<<<grid, 256, 0, stage_stream>>>(ids, table, k, n_expert, m, frac256, gtab, args, zero_unused);
     cudaEventRecord(stage_join, stage_stream);
+}
+
+struct hpcache_dev_hit {
+    const int32_t * table;
+    __device__ bool operator()(int e) const { return table != nullptr && table[e] >= 0; }
+};
+
+// the stage kernel of a window: the selection is made by every block, block 0 also writes the table of the staged experts
+static __global__ void pcie_stage_window_kernel(const int32_t * ids, int stride, int n_tok, const int32_t * table, int k,
+        int n_expert, int cap, hpcache_win_model mdl, int32_t * stage_table, hpcache_stage_args a, bool zero_unused) {
+    __shared__ int32_t sel[32];
+    __shared__ int g;
+    if (threadIdx.x == 0) {
+        g = hpcache_window_select(ids, stride, n_tok, k, n_expert, hpcache_dev_hit{ table }, cap < 32 ? cap : 32, mdl, sel);
+    }
+    __syncthreads();
+    if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0) {
+        for (int e = threadIdx.x; e < n_expert; e += blockDim.x) {
+            stage_table[e] = -1;
+        }
+        __syncthreads();
+        if (threadIdx.x < g) {
+            stage_table[sel[threadIdx.x]] = threadIdx.x;
+        }
+    }
+
+    const int j = blockIdx.x;
+    const int t = blockIdx.y;
+    if (t >= a.n_tensors) {
+        return;
+    }
+    const size_t n16 = a.bytes[t] / 16;
+    const bool fill = j < g;
+    if (!fill && !zero_unused) {
+        return;   // an unused slot that no op reads (miss id -1)
+    }
+    const uint4 * src = fill ? reinterpret_cast<const uint4 *>(static_cast<const char *>(a.src[t]) + size_t(sel[j]) * a.bytes[t]) : nullptr;
+    uint4 * dst = reinterpret_cast<uint4 *>(static_cast<char *>(a.dst[t]) + size_t(j) * a.bytes[t]);
+    const size_t chunk = 1024;
+    for (size_t base = size_t(blockIdx.z) * chunk; base < n16; base += size_t(gridDim.z) * chunk) {
+        const size_t end = base + chunk < n16 ? base + chunk : n16;
+        if (fill) {
+            copy_u4<4>(dst, src, base, end, threadIdx.x, blockDim.x);
+        } else {
+            for (size_t i = base + threadIdx.x; i < end; i += blockDim.x) {
+                dst[i] = make_uint4(0, 0, 0, 0);
+            }
+        }
+    }
+}
+
+void hpcache_cuda_pcie_stage_window(void * stream, const int32_t * ids, int stride, int n_tok, const int32_t * table, int k,
+        int n_expert, int cap, const hpcache_win_model & mdl, int32_t * stage_table, const hpcache_stage_args & args, bool side,
+        bool zero_unused) {
+    const dim3 grid(unsigned(cap), unsigned(args.n_tensors), stage_z());
+    if (!side) {
+        pcie_stage_window_kernel<<<grid, 256, 0, (cudaStream_t) stream>>>(ids, stride, n_tok, table, k, n_expert, cap, mdl, stage_table, args,
+                zero_unused);
+        return;
+    }
+    if (stage_stream == nullptr) {
+        cudaStreamCreateWithFlags(&stage_stream, cudaStreamNonBlocking);
+        cudaEventCreateWithFlags(&stage_fork, cudaEventDisableTiming);
+        cudaEventCreateWithFlags(&stage_join, cudaEventDisableTiming);
+    }
+    cudaEventRecord(stage_fork, (cudaStream_t) stream);
+    cudaStreamWaitEvent(stage_stream, stage_fork, 0);
+    pcie_stage_window_kernel<<<grid, 256, 0, stage_stream>>>(ids, stride, n_tok, table, k, n_expert, cap, mdl, stage_table, args,
+            zero_unused);
+    cudaEventRecord(stage_join, stage_stream);
+}
+
+static __global__ void fill_neg_inf_kernel(float * out, long long n) {
+    const float v = __int_as_float(0xff800000);   // -INFINITY
+    for (long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (long long) gridDim.x * blockDim.x) {
+        out[i] = v;
+    }
+}
+
+static __global__ void scatter_logits_kernel(const float * sub, const int32_t * ids, int n_sub, int n_vocab, int n_tokens, float * out) {
+    const long long total = (long long) n_sub * n_tokens;
+    for (long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x; i < total; i += (long long) gridDim.x * blockDim.x) {
+        const long long t = i / n_sub;
+        const int       j = (int) (i - t * n_sub);
+        out[t * n_vocab + ids[j]] = sub[i];
+    }
+}
+
+void hpcache_cuda_scatter_logits(void * stream, const float * sub, const int32_t * ids, int n_sub, int n_vocab, int n_tokens, float * out) {
+    const long long n_out = (long long) n_vocab * n_tokens;
+    const long long n_in  = (long long) n_sub * n_tokens;
+    cudaStream_t s = (cudaStream_t) stream;
+    fill_neg_inf_kernel<<<(unsigned) ((n_out + 255) / 256 < 1024 ? (n_out + 255) / 256 : 1024), 256, 0, s>>>(out, n_out);
+    scatter_logits_kernel<<<(unsigned) ((n_in + 255) / 256 < 1024 ? (n_in + 255) / 256 : 1024), 256, 0, s>>>(sub, ids, n_sub, n_vocab, n_tokens, out);
 }
 
 void hpcache_cuda_pcie_stage_join(void * stream) {

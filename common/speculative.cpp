@@ -2714,6 +2714,10 @@ common_speculative_init_result::common_speculative_init_result(
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
+    // a draft model takes from the MoE provider of the target only the output head (a draft vocabulary), not the placement
+    // and scheduling of experts
+    mparams.moe_output_provider = llama_model_get_moe_provider(model_tgt);
+
     if (spec_mtp) {
         cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
     }

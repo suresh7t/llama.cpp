@@ -25,18 +25,27 @@ struct hpcache_pool_options {
     bool        enabled       = true;
     size_t      pool_bytes    = 0;                 // 0: free device memory minus reserve_bytes, capped by plan_bytes
     size_t      reserve_bytes = size_t(1280) << 20; // left free for compute buffers and the desktop
+    size_t      headroom_bytes = SIZE_MAX;          // left free on top of that so that the OS does not page idle weights out; SIZE_MAX: min(1.5 GiB, a tenth of the card)
     size_t      plan_bytes    = 0;                 // plan budget, the pool may exceed it by 10%
     int         n_layers      = 0;                 // MoE layers, to split an unranked pool evenly
+    int         max_tokens    = 8;                 // most tokens of one decode window (sequences decoded together)
     std::string profile;                           // Strata expert profile, ranked (layer, expert) pairs
     bool        cpu_kernel    = true;              // own expert kernel, false: a ggml graph per layer
     bool        prefault      = true;              // read all expert pages once at load, so decode never waits on the disk
     int         swap_every    = 1;                 // decode steps between admission rounds
-    int         max_swaps     = 24;                // experts replaced per round
+    int         max_swaps     = 48;                // experts replaced per round (one per layer at most: 48 layers; 24 left ~0.4 CPU experts per window unserved)
     int         fill_swaps    = 64;                // experts loaded per round into empty slots
+    int         tail_skip     = 7;               // CHANGES THE OUTPUT. R > 0: a missed expert that every token of the window routes at rank >= R
+                                                   // (R of the top-k, 0 based) and that the CPU would compute is skipped, its weight is not renormalised (as Strata's STRATA_ROUTE_TAIL_SKIP). 0 = off
     float       decay         = 0.9f;              // score decay per round
     bool        async_swaps   = true;              // copy replaced experts during the next step, publish them one step later
+    bool        swap_kernel   = true;              // a kernel copies the swaps from the page-locked arena (the copy engine stays free for
+                                                   // the inputs of the next decode, +1.6 t/s with MTP); experts outside the page-locked part
+                                                   // still use the copier. swap_kernel=0 or HPCACHE_SWAP_KERNEL=0: the copier takes all
     bool        pcie          = true;              // the GPU computes a share of the missed experts from the arena, over PCIe
     int         pcie_max      = 3;                 // most experts per layer on that path
+    int         pcie_win_max  = 6;                 // most experts per layer on that path for a window of several tokens
+    bool        pcie_multi    = true;              // the PCIe path serves windows of several tokens too (HPCACHE_PCIE_MULTI=0 turns it off)
     float       pcie_frac     = 0.55f;             // start share of the missed experts of a layer
     bool        pcie_adapt    = true;              // move the share toward balance from the measured GPU wait
     bool        arena         = true;              // read the expert tensors from the GGUF into one page-locked region
@@ -63,6 +72,8 @@ public:
     hpcache_decoder & operator=(const hpcache_decoder &) = delete;
 
     bool ok() const { return cpu != nullptr; }
+    // number of MoE layers of the model, when the options did not say; splits an unranked pool evenly
+    void set_moe_layers(int n) { if (opts.n_layers <= 0) { opts.n_layers = n; } }
 
     // returns NULL when the layer is not supported, so that the core builds the stock path
     ggml_tensor * build_layer(const llama_moe_layer_request & req);
@@ -83,6 +94,8 @@ public:
         int pcie_m = 0;          // experts on the PCIe path, 0 = none
         const volatile int32_t * pcie_frac = nullptr;   // device address of the share, read by the kernels
         const hpcache_stage_args * stage = nullptr;
+        int32_t * stage_table = nullptr;   // window path: expert -> staging slot, -1 when not staged
+        int win_cap = 0;         // window path: most staged experts
         int32_t miss_id = 0;     // id of a missed expert in the pool ops: 0, or -1 when the matvec skips it
         int stamp_event = 0;     // event log: the event a stamp op records
         const ggml_tensor * g2_in = nullptr;   // second card: its input block, holds the sequence number
@@ -149,6 +162,11 @@ private:
     size_t   pcie_slot_bytes = 0;               // size of one staging slot
     int      pcie_alias = -1;                   // 1 when the device address of the arena is its host address
     int64_t  n_pcie_experts = 0;
+    int64_t  n_tail_skipped = 0;   // missed experts the CPU did not compute (tail_skip)
+    int32_t * d_stage_table = nullptr;          // device table of the staged experts of a window, shared by all layers
+    int      stage_table_n = 0;
+    int64_t  n_pcie_win_experts = 0;            // experts staged for windows of several tokens
+    int64_t  n_pcie_win_windows = 0;
     // copier timing: how long a batch of swaps takes to land, and how long the next round waits for it
     int64_t  copy_batches = 0, copy_us_sum = 0, copy_us_max = 0;
     int64_t  pub_waits = 0, pub_blocked = 0, pub_wait_us_sum = 0, pub_wait_us_max = 0;
@@ -163,6 +181,8 @@ private:
     unsigned long long adapt_last_wait_ns = 0;
     double   last_wait_us_per_layer = 0.0;
     void prefault_layer(layer & l, int il);
+    std::vector<int32_t> grp_of;         // expert -> group of the window being served, -1 outside serve()
+    int64_t n_dedup_pairs = 0, n_dedup_groups = 0;   // CPU (token, expert) pairs of the windows, and the distinct experts among them
     int64_t verify_n = 0;
     double  verify_sum = 0.0, verify_max = 0.0;
     int64_t prefault_bytes = 0;
@@ -181,6 +201,7 @@ private:
     bool     pool_init = false;
     bool     pool_grown = false;                  // grow_pool() has run for this pool
     size_t   pool_budget = 0;
+    size_t   pool_headroom = 0;                   // left free at sizing, kept by grow_pool()
     size_t   pool_used = 0;
     int64_t  pool_slots = 0;
     int64_t  pool_rank_limit = 0;                 // end of the profile ranks that the pool takes (first rank: rank_base)
@@ -213,6 +234,8 @@ private:
     int      steps = 0;
     std::atomic<int64_t> n_routed{0};
     std::atomic<int64_t> n_hit{0};
+    // pool hits by position in the window: [window size 1..8][position][0 routed, 1 pool hit, 2 staged over PCIe]
+    int64_t pos_stat[9][8][3] = {};
     int64_t  n_swapped = 0;
     int64_t  swap_us = 0;
 
@@ -229,6 +252,11 @@ private:
     void copier_main();
     void copier_submit(const std::vector<pending_swap> & jobs);
     void copier_wait();
+    // swap_kernel: the copies of the layers whose arena the GPU can read go to one kernel, the rest to the copier
+    void submit_swaps(const std::vector<pending_swap> & jobs);
+    bool swap_sources(layer & l);
+    bool    swap_kernel_busy = false;
+    int64_t n_swap_kernel = 0, n_swap_copier = 0, n_swap_launches = 0;
     std::thread             copier;
     hpcache_sync::spinlock  copier_lock;     // copier_jobs and the copy statistics
     hpcache_sync::signal    copier_work;     // jobs queued or quit

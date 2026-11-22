@@ -1,3 +1,4 @@
+#include "llama-moe-provider.h"
 #include "models.h"
 #include "llama-impl.h"
 #include "llama-memory-hybrid-idx.h"
@@ -668,7 +669,25 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
-    cur = build_lora_mm(model.output, cur, model.output_s);
+    // a provider can compute the head over a subset of the vocabulary (a draft head), the logits keep the full width
+    ggml_tensor * logits = nullptr;
+    if (const auto * out_provider = model.moe_output_provider();
+            out_provider != nullptr && out_provider->build_output != nullptr && model.output_s == nullptr &&
+            (loras == nullptr || loras->empty())) {
+        const llama_moe_output_request out_req = {
+            /*.ctx           =*/ ctx0,
+            /*.gf            =*/ gf,
+            /*.cur           =*/ cur,
+            /*.output        =*/ model.output,
+            /*.model         =*/ &model,
+            /*.n_embd        =*/ (int32_t) cur->ne[0],
+            /*.n_vocab       =*/ (int32_t) model.output->ne[1],
+            /*.n_tokens      =*/ (int32_t) cur->ne[1],
+            /*.is_draft_head =*/ 1,
+        };
+        logits = out_provider->build_output(out_provider->handle, &out_req);
+    }
+    cur = logits != nullptr ? logits : build_lora_mm(model.output, cur, model.output_s);
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 }

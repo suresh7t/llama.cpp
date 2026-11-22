@@ -2,6 +2,7 @@
 #include "hpcache.h"
 #ifdef HPCACHE_CUDA
 #include "hpcache-decode.h"
+#include "hpcache-draft-head.h"
 #endif
 
 #include <atomic>
@@ -77,6 +78,25 @@ std::string pin_process(const std::string & cpu_list, int n_cores_wanted) {
     (void) cpu_list;
     (void) n_cores_wanted;
     return "";
+#endif
+}
+
+// Physical cores of the machine, 0 when unknown.
+int physical_cores() {
+#if defined(_WIN32)
+    DWORD len = 0;
+    GetLogicalProcessorInformation(nullptr, &len);
+    std::vector<SYSTEM_LOGICAL_PROCESSOR_INFORMATION> info(len / sizeof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION));
+    if (len == 0 || !GetLogicalProcessorInformation(info.data(), &len)) {
+        return 0;
+    }
+    int n = 0;
+    for (const auto & entry : info) {
+        n += entry.Relationship == RelationProcessorCore;
+    }
+    return n;
+#else
+    return 0;
 #endif
 }
 
@@ -167,6 +187,7 @@ struct hpcache_provider {
 
 #ifdef HPCACHE_CUDA
     std::unique_ptr<hpcache_decoder> decoder;
+    std::unique_ptr<hpcache_draft_head> draft_head;   // draft_vocab=<file of int32 ids>: the MTP head over a subset of the vocabulary
 #endif
 
     void log(enum ggml_log_level level, const std::string & message) const {
@@ -322,6 +343,7 @@ void provider_place(void * handle, const llama_moe_device_info * devices, int32_
     }
 
     int32_t n_expert_tensors = 0;
+    int32_t max_layer = -1;
     for (int32_t i = 0; i < n_tensors; ++i) {
         switch (tensors[i].kind) {
             case LLAMA_MOE_TENSOR_EXPERT_GATE:
@@ -331,12 +353,18 @@ void provider_place(void * handle, const llama_moe_device_info * devices, int32_
                 homes[i].kind   = LLAMA_MOE_HOME_DEVICE;
                 homes[i].device = 0;
                 ++n_expert_tensors;
+                max_layer = std::max(max_layer, tensors[i].layer);
                 break;
             default:
                 break;
         }
     }
     provider->log(GGML_LOG_LEVEL_INFO, "placing " + std::to_string(n_expert_tensors) + " expert tensors on the CPU");
+#ifdef HPCACHE_CUDA
+    if (provider->decoder && max_layer >= 0) {
+        provider->decoder->set_moe_layers(max_layer + 1);
+    }
+#endif
 }
 
 // without a decoder, the core builds the stock path
@@ -379,6 +407,20 @@ void provider_decode_end(void * handle) {
 #endif
 }
 
+// the output head of a model: only the draft head of an MTP graph is taken, over the tokens of draft_vocab
+ggml_tensor * provider_build_output(void * handle, const llama_moe_output_request * req) {
+#ifdef HPCACHE_CUDA
+    auto * provider = static_cast<hpcache_provider *>(handle);
+    if (provider->draft_head && req->is_draft_head) {
+        return provider->draft_head->build(*req);
+    }
+#else
+    (void) handle;
+    (void) req;
+#endif
+    return nullptr;
+}
+
 void provider_free(void * handle) {
     auto * provider = static_cast<hpcache_provider *>(handle);
     provider->log(GGML_LOG_LEVEL_INFO, "hook calls: build_moe_layer " + std::to_string(provider->n_build_layer.load()) +
@@ -414,6 +456,19 @@ extern "C" MOE_HPCACHE_EXPORT const llama_moe_provider_api * llama_moe_provider_
     provider->log(GGML_LOG_LEVEL_INFO, "placement plan validated");
 
 #ifdef HPCACHE_CUDA
+    {
+        const char * draft_vocab = host->get_param != nullptr ? host->get_param(host->ctx, "draft_vocab") : nullptr;
+        if (draft_vocab != nullptr && draft_vocab[0] != 0) {
+            provider->draft_head = std::make_unique<hpcache_draft_head>(draft_vocab,
+                    [](void * ctx, enum ggml_log_level level, const std::string & msg) {
+                        static_cast<hpcache_provider *>(ctx)->log(level, msg);
+                    }, provider.get());
+            provider->log(GGML_LOG_LEVEL_INFO, std::string("draft vocabulary: ") + draft_vocab);
+        }
+    }
+#endif
+
+#ifdef HPCACHE_CUDA
     const char * doorbell = host->get_param != nullptr ? host->get_param(host->ctx, "doorbell") : nullptr;
     if (doorbell != nullptr && atoi(doorbell) == 0) {
         provider->log(GGML_LOG_LEVEL_INFO, "doorbell decode disabled, placement only");
@@ -422,6 +477,17 @@ extern "C" MOE_HPCACHE_EXPORT const llama_moe_provider_api * llama_moe_provider_
         int n_threads = value != nullptr ? atoi(value) : 0;
         if (n_threads <= 0) {
             n_threads = 4;
+        }
+        // The CPU pool threads spin on barriers: with one per core, the host thread, the driver and the copier have no core
+        // left and every layer stalls (23 ms instead of 0.2 ms per layer). Keep two cores free.
+        const int cores = physical_cores();
+        const char * cap_env = getenv("HPCACHE_MAX_THREADS");   // experiment: lift the cap
+        if (cap_env != nullptr) {
+            provider->log(GGML_LOG_LEVEL_INFO, std::string("HPCACHE_MAX_THREADS set, thread cap not applied: ") + std::to_string(n_threads));
+        } else if (cores > 3 && n_threads > cores - 2) {
+            provider->log(GGML_LOG_LEVEL_INFO, "CPU threads reduced from " + std::to_string(n_threads) + " to " +
+                    std::to_string(cores - 2) + ": " + std::to_string(cores) + " physical cores, two stay free for the host");
+            n_threads = cores - 2;
         }
         auto param = [&](const char * name) {
             const char * v = host->get_param != nullptr ? host->get_param(host->ctx, name) : nullptr;
@@ -433,6 +499,9 @@ extern "C" MOE_HPCACHE_EXPORT const llama_moe_provider_api * llama_moe_provider_
         }
         if (!param("pool_mib").empty()) {
             pool.pool_bytes = size_t(atoll(param("pool_mib").c_str())) << 20;
+        }
+        if (!param("headroom_mib").empty()) {
+            pool.headroom_bytes = size_t(atoll(param("headroom_mib").c_str())) << 20;
         }
         if (!param("reserve_mib").empty()) {
             pool.reserve_bytes = size_t(atoll(param("reserve_mib").c_str())) << 20;
@@ -475,6 +544,12 @@ extern "C" MOE_HPCACHE_EXPORT const llama_moe_provider_api * llama_moe_provider_
         if (!param("async_swaps").empty()) {
             pool.async_swaps = atoi(param("async_swaps").c_str()) != 0;
         }
+        if (!param("swap_kernel").empty()) {
+            pool.swap_kernel = atoi(param("swap_kernel").c_str()) != 0;
+        }
+        if (const char * e = getenv("HPCACHE_SWAP_KERNEL")) {
+            pool.swap_kernel = atoi(e) != 0;
+        }
         if (!param("arena").empty()) {
             pool.arena = atoi(param("arena").c_str()) != 0;
         }
@@ -497,11 +572,17 @@ extern "C" MOE_HPCACHE_EXPORT const llama_moe_provider_api * llama_moe_provider_
         if (!param("pcie").empty()) {
             pool.pcie = atoi(param("pcie").c_str()) != 0;
         }
+        if (!param("max_tokens").empty()) {
+            pool.max_tokens = std::max(1, std::min(32, atoi(param("max_tokens").c_str())));
+        }
         if (!param("pcie_max").empty()) {
             pool.pcie_max = atoi(param("pcie_max").c_str());
         } else if (pool.gpu2) {
             // with a second card the CPU has room for what the first card streams: 2 experts per layer decode 3.5% faster than 3
             pool.pcie_max = 2;
+        }
+        if (!param("pcie_win_max").empty()) {
+            pool.pcie_win_max = atoi(param("pcie_win_max").c_str());
         }
         if (!param("pcie_frac").empty()) {
             pool.pcie_frac = float(atof(param("pcie_frac").c_str()));
@@ -517,6 +598,9 @@ extern "C" MOE_HPCACHE_EXPORT const llama_moe_provider_api * llama_moe_provider_
         }
         if (!param("max_swaps").empty()) {
             pool.max_swaps = atoi(param("max_swaps").c_str());
+        }
+        if (!param("tail_skip").empty()) {
+            pool.tail_skip = atoi(param("tail_skip").c_str());
         }
         pool.profile = param("profile");
         for (const auto & device : provider->plan.devices) {
@@ -555,6 +639,7 @@ extern "C" MOE_HPCACHE_EXPORT const llama_moe_provider_api * llama_moe_provider_
     provider->api.build_moe_layer = provider_build_moe_layer;
     provider->api.decode_begin   = provider_decode_begin;
     provider->api.decode_end     = provider_decode_end;
+    provider->api.build_output   = provider_build_output;
     provider->api.free           = provider_free;
 
     return &provider.release()->api;
